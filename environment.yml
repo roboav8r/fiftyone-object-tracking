@@ -1,0 +1,28 @@
+# Conda env for *developing* the plugin (running the operators outside
+# the App, hacking on the JS bundle, etc.).
+#
+# Customers don't need this — they install the plugin into their FOE
+# deployment via:
+#
+#   fiftyone plugins download \
+#       https://github.com/roboav8r/fiftyone-object-tracking-plugin
+#
+# Create:   mamba env create -f environment.yml
+# Activate: mamba activate fiftyone-object-tracking-plugin
+
+name: fiftyone-object-tracking-plugin
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - python-dotenv
+      # Operator runtime deps:
+      - numpy
+      - scipy
+      - pandas
+      - pyarrow
+      # Pin starlette under FOE's compatibility ceiling (FOE SDK still
+      # uses on_event); newer Starlette removed it.
+      - "starlette<0.36"

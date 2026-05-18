@@ -1,0 +1,23 @@
+# Python.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Conda / virtualenv.
+.venv/
+venv/
+env/
+
+# Editor / OS.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local-only Claude settings.
+.claude/settings.local.json
+
+# Local trajectory output (only created if someone runs build_trajectories
+# with the default trajectory_root).
+trajectories/
