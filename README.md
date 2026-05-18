@@ -41,6 +41,21 @@ The plugin's Python operators need `numpy`, `scipy`, `pandas`, and
 `pyarrow` (see `requirements.txt`); install them in your FOE
 deployment's Python environment.
 
+For Enterprise deployments (the App server runs in a container):
+
+```bash
+# Identify the App service in your compose stack
+docker compose ps
+# Install the deps into the App server's Python
+docker compose exec <app-service> pip install pyarrow
+# (numpy, scipy, pandas are typically already present from the FOE base image)
+```
+
+If `pyarrow` is missing, the `read_trajectory_payload` operator will
+fail with `ModuleNotFoundError("No module named 'pyarrow'")` and the
+`TrajectoryRenderer` grid cells will show that error instead of the
+BEV plot.
+
 ## What it expects on the source dataset
 
 The `build_trajectories` operator consumes a grouped FiftyOne dataset

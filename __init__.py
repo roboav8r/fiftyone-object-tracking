@@ -345,6 +345,10 @@ class ReadTrajectoryPayload(foo.Operator):
 
     def execute(self, ctx) -> dict[str, Any]:
         sample_id = ctx.params["sample_id"]
+        # The App's modal surface passes "<id>-modal" through to the
+        # renderer; strip the suffix so ctx.dataset[...] still resolves.
+        if isinstance(sample_id, str) and sample_id.endswith("-modal"):
+            sample_id = sample_id[: -len("-modal")]
         try:
             sample = ctx.dataset[sample_id]
         except KeyError:
