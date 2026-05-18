@@ -37,24 +37,129 @@ cd fiftyone-object-tracking-plugin
 ./install.sh   # symlinks into ~/fiftyone/__plugins__/
 ```
 
-The plugin's Python operators need `numpy`, `scipy`, `pandas`, and
-`pyarrow` (see `requirements.txt`); install them in your FOE
-deployment's Python environment.
+### Python runtime dependencies
 
-For Enterprise deployments (the App server runs in a container):
-
-```bash
-# Identify the App service in your compose stack
-docker compose ps
-# Install the deps into the App server's Python
-docker compose exec <app-service> pip install pyarrow
-# (numpy, scipy, pandas are typically already present from the FOE base image)
-```
+The plugin's operators need `numpy`, `scipy`, `pandas`, and `pyarrow`
+(see `requirements.txt`). `numpy` / `scipy` / `pandas` are already in
+the FOE base image; **`pyarrow` is not** and must be installed into
+every service that executes plugin operator code.
 
 If `pyarrow` is missing, the `read_trajectory_payload` operator will
 fail with `ModuleNotFoundError("No module named 'pyarrow'")` and the
 `TrajectoryRenderer` grid cells will show that error instead of the
 BEV plot.
+
+#### Which services need pyarrow?
+
+FiftyOne Teams runs plugin Python in **multiple** services:
+
+| Service | Role | Needs `pyarrow`? |
+|---|---|---|
+| `fiftyone-app` | App-server-side operator execution for non-Teams installs | yes |
+| `teams-plugins` | Synchronous plugin-operator execution (Teams) | **yes** (this is where `read_trajectory_payload` runs in your deployment) |
+| `teams-do` (× N replicas) | Delegated-operator workers | yes (if you'll ever run `build_trajectories` in delegated mode) |
+| `teams-api` | Teams API server | optional today, but recommended for future-proofing |
+| `teams-app` | React UI image; no Python operators | no |
+| `teams-cas` | Auth service | no |
+
+The exact service names depend on your compose project / helm release.
+
+#### Quick check (any deployment)
+
+```bash
+# Run against each FOE Python service to confirm pyarrow is reachable
+docker exec <service-container> python -c "import pyarrow; print(pyarrow.__version__)"
+# (or, in a helm pod:)
+kubectl exec -n <namespace> <pod> -- python -c "import pyarrow; print(pyarrow.__version__)"
+```
+
+#### Quick fix (short-lived)
+
+Drop pyarrow into running containers / pods. **Reverted on next
+container restart**, so this is for testing only:
+
+```bash
+# Docker Compose
+for c in <project>-fiftyone-app-1 <project>-teams-plugins-1 \
+         <project>-teams-do-1 <project>-teams-do-2 <project>-teams-do-3 \
+         <project>-teams-api-1; do
+    docker exec "$c" pip install --no-cache-dir pyarrow
+done
+
+# Helm / Kubernetes
+for pod in $(kubectl get pods -n <ns> -l app.kubernetes.io/name=fiftyone -o name); do
+    kubectl exec -n <ns> "$pod" -- pip install --no-cache-dir pyarrow
+done
+```
+
+#### Durable fix — bake into a custom image (recommended)
+
+Build an image FROM the FOE base, add `pyarrow`, and point the
+operator-running services at that image. Survives container
+recreation, helm upgrades, etc.
+
+**Dockerfile** (next to your compose.yaml):
+
+```dockerfile
+# Dockerfile.fiftyone-with-pyarrow
+ARG FIFTYONE_VERSION
+FROM voxel51/fiftyone-app:${FIFTYONE_VERSION}
+RUN pip install --no-cache-dir pyarrow
+```
+
+**Docker Compose** — override the image for every Python-running service:
+
+```yaml
+# compose.override.yaml
+services:
+  fiftyone-app: &with-pyarrow
+    build:
+      context: .
+      dockerfile: Dockerfile.fiftyone-with-pyarrow
+      args:
+        FIFTYONE_VERSION: "2.18.0"   # match your deployment
+    image: local/fiftyone-app-with-pyarrow:2.18.0
+  teams-plugins:
+    <<: *with-pyarrow
+  teams-do:
+    <<: *with-pyarrow
+
+# then
+docker compose build
+docker compose up -d
+```
+
+**Helm** — push the custom image to a registry the cluster can reach,
+then override the image in `values.yaml` for the relevant services
+(the exact key names depend on your chart version; check `helm show
+values voxel51/fiftyone-teams-app`):
+
+```yaml
+# values.yaml
+apiSettings:
+  image:
+    repository: my-registry/fiftyone-app-with-pyarrow
+    tag: 2.18.0
+pluginsSettings:                  # for Teams; key sometimes named teamsPlugins
+  image:
+    repository: my-registry/fiftyone-app-with-pyarrow
+    tag: 2.18.0
+delegatedOperatorExecutorSettings: # key sometimes teamsDo / delegatedOperator
+  image:
+    repository: my-registry/fiftyone-app-with-pyarrow
+    tag: 2.18.0
+appSettings:
+  image:
+    repository: my-registry/fiftyone-app-with-pyarrow
+    tag: 2.18.0
+
+# then
+helm upgrade --install fiftyone voxel51/fiftyone-teams-app -f values.yaml
+```
+
+If your chart exposes a `extraEnvFrom` or `initContainers` hook
+instead, an init container that runs `pip install pyarrow` against a
+shared volume can work but is fiddlier than rebuilding the image.
 
 ## What it expects on the source dataset
 
