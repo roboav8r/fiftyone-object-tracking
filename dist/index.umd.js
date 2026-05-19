@@ -916,6 +916,8 @@
   function BEVPanel(props) {
     var listScenesOp = foo.useOperatorExecutor(OP("list_tracking_scenes"));
     var getPayloadOp = foo.useOperatorExecutor(OP("get_scene_track_payload"));
+    var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
+    var getCamUrlsOp = foo.useOperatorExecutor(OP("get_camera_frame_urls"));
 
     // FOE plugin SDK injects isModalPanel + dimensions on the panel props.
     // Default to grid behavior if the prop is missing.
@@ -947,6 +949,23 @@
     var [scrubFrameIdx, setScrubFrameIdx] = useState(null);
     var [hoveredInstanceId, setHoveredInstanceId] = useState(null);
     var [selectedInstanceId, setSelectedInstanceId] = useState(null);
+    // Which group slice the inline camera thumbnail mirrors. Default
+    // "image_02" for KITTI/multi-camera datasets; user can change in
+    // the header dropdown. Set to null to hide the thumbnail.
+    var [cameraMirrorSlice, setCameraMirrorSlice] = useState("image_02");
+    // Cache: { "<scene>:<slice>": { "<frame_idx>": url } }
+    var [cameraUrlsCache, _setCameraUrlsCache] = useState({});
+    var cameraUrlsCacheRef = useRef(cameraUrlsCache);
+    cameraUrlsCacheRef.current = cameraUrlsCache;
+    var setCameraUrlsCache = function (updater) {
+      _setCameraUrlsCache(function (prev) {
+        var next = typeof updater === "function" ? updater(prev) : updater;
+        cameraUrlsCacheRef.current = next;
+        return next;
+      });
+    };
+    var camCacheKey = (selectedScene && cameraMirrorSlice)
+      ? (selectedScene + ":" + cameraMirrorSlice) : null;
 
     // ---- Recoil read sources ----
     // Modal-mode current sample id; only meaningful when isModal === true.
@@ -970,19 +989,18 @@
     try { setSelectedSamples = recoil.useSetRecoilState(fos.selectedSamples); }
     catch (e) { /* atom not exported */ }
 
-    // Modal-mode: write the modal sample id. fos.modalSelector is the
-    // newer string-id setter; fos.modal is the structured object setter.
+    // FO 2.18 split the modal atom into multiple granular atoms
+    // (currentModalSlice, modalGroupSlice, currentModalUniqueIdJotaiAtom,
+    // useExpandSample, ...). The single-string-ID setter pattern that
+    // worked in earlier versions now triggers a GraphQL failure because
+    // the partial atom shape can't be resolved into a full modal state
+    // (missing group + slice context). Rather than chase the right
+    // multi-atom write sequence per FO version, the plugin treats modal
+    // sync as App → panel only: opening the modal yourself + scrubbing
+    // the panel updates the panel's BEV state, but the modal looker
+    // does NOT auto-jump on scrub. For a per-frame camera view, see
+    // the inline camera-mirror thumbnail (option-C).
     var setModalSample = null;
-    try {
-      var _setSel = recoil.useSetRecoilState(fos.modalSelector);
-      setModalSample = function (sid) { _setSel(sid); };
-    } catch (e) { /* not exposed */ }
-    if (!setModalSample) {
-      try {
-        var _setMod = recoil.useSetRecoilState(fos.modal);
-        setModalSample = function (sid) { _setMod({ sample: { id: sid } }); };
-      } catch (e) { /* not exposed either; modal jump becomes a no-op */ }
-    }
 
     // ---- Operator-call pattern. FOE's useOperatorExecutor uses fire-and-
     //      forget .execute() + a polled .result property; .then() chains do
@@ -1024,6 +1042,44 @@
         console.error("[bev-panel] get_scene_track_payload throw", e);
       }
     }, [selectedScene]);
+
+    // Fire get_camera_frame_urls when (scene, slice) changes and
+    // the cache doesn't already have that key. Deduped via a ref.
+    var lastCamFetchKeyRef = useRef(null);
+    useEffect(function () {
+      if (!camCacheKey) return;
+      if (cameraUrlsCacheRef.current[camCacheKey]) return;
+      if (lastCamFetchKeyRef.current === camCacheKey) return;
+      lastCamFetchKeyRef.current = camCacheKey;
+      try {
+        getCamUrlsOp.execute({
+          scene_name: selectedScene,
+          camera_slice: cameraMirrorSlice,
+        });
+      } catch (e) {
+        console.error("[bev-panel] get_camera_frame_urls throw", e);
+      }
+    }, [camCacheKey]);
+
+    // Consume get_camera_frame_urls result.
+    var lastConsumedCamUrlsRef = useRef(null);
+    useEffect(function () {
+      var result = getCamUrlsOp.result;
+      if (!result || result === lastConsumedCamUrlsRef.current) return;
+      lastConsumedCamUrlsRef.current = result;
+      var out = result.result || result;
+      if (out && out.error) {
+        console.warn("[bev-panel] get_camera_frame_urls:", out.error);
+        return;
+      }
+      if (!out || !out.scene_name || !out.camera_slice) return;
+      var key = out.scene_name + ":" + out.camera_slice;
+      setCameraUrlsCache(function (prev) {
+        var next = Object.assign({}, prev);
+        next[key] = out.frame_urls || {};
+        return next;
+      });
+    }, [getCamUrlsOp.result]);
 
     // Consume get_scene_track_payload result.
     var lastConsumedPayloadRef = useRef(null);
@@ -1087,25 +1143,14 @@
       if (!sid || sid === lastCommitted.current) return;
       lastCommitted.current = sid;
 
-      if (isModal) {
-        if (setModalSample) setModalSample(sid);
-        else console.warn("[bev-panel] no modal setter — scrub is view-only");
-      } else {
-        if (setSelectedSamples) setSelectedSamples(new Set([sid]));
-        else console.warn("[bev-panel] no selectedSamples setter");
+      // Grid mode: highlight the lidar sample at this frame so the user
+      // can double-click into the modal manually. Modal mode: no-op
+      // (FO 2.18 modal atom too fragile to write from a plugin; see the
+      // "setModalSample = null" comment block above).
+      if (!isModal && setSelectedSamples) {
+        setSelectedSamples(new Set([sid]));
       }
-    }, [payload, isModal, setSelectedSamples, setModalSample]);
-
-    // Open-in-modal escape hatch (used from a header button in grid mode).
-    var openInModal = useCallback(function () {
-      if (!payload || scrubFrameIdx == null) return;
-      var idx = payload.frame_indices.indexOf(scrubFrameIdx);
-      if (idx < 0) return;
-      var sid = payload.lidar_sample_ids[idx];
-      if (!sid) return;
-      if (setModalSample) setModalSample(sid);
-      else console.warn("[bev-panel] no modal setter — can't open modal");
-    }, [payload, scrubFrameIdx, setModalSample]);
+    }, [payload, isModal, setSelectedSamples]);
 
     function onScrub(frameIdx) { setScrubFrameIdx(frameIdx); }
     function onCommit(frameIdx) {
@@ -1159,23 +1204,62 @@
         style: { flex: 1, display: "flex", justifyContent: "center" },
       }, h(ClassLegend, { payload: payload })),
 
-      // Grid-only escape hatch: pop the modal at the scrubbed frame.
-      !isModal && payload && scrubFrameIdx != null
-        ? h("button", {
-            key: "open-modal",
-            onClick: openInModal,
-            disabled: !setModalSample,
-            title: setModalSample
-              ? "Open the lidar sample at the current frame in the modal"
-              : "Modal setter unavailable on this FOE version",
-            style: {
-              background: setModalSample ? "#2a4a6a" : "#333",
-              color: "#eee", border: "1px solid #444", borderRadius: 4,
-              padding: "4px 8px", cursor: setModalSample ? "pointer" : "not-allowed",
-              fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
-            },
-          }, "Open in modal")
+      // Camera-mirror dropdown: picks which group slice the inline
+      // thumbnail mirrors. Hidden until the scene payload has loaded so
+      // we can populate the option list from the actual group slices.
+      sceneInfo && sceneInfo.group_slices && sceneInfo.group_slices.all
+        ? h("label", { key: "cam-pick" }, [
+            "  Camera: ",
+            h("select", {
+              key: "cam-sel",
+              value: cameraMirrorSlice || "",
+              onChange: function (e) { setCameraMirrorSlice(e.target.value || null); },
+              style: { background: "#222", color: "#eee", border: "1px solid #444" },
+            }, [h("option", { key: "_none", value: "" }, "(none)")].concat(
+              sceneInfo.group_slices.all
+                .filter(function (s) { return s !== "lidar" && s !== "lidar_livox"; })
+                .map(function (s) {
+                  return h("option", { key: s, value: s }, s);
+                })
+            )),
+          ])
         : null,
+
+      // View patches button — fires the view_track_patches operator
+      // against the currently-selected track. Disabled when no track
+      // is selected.
+      h("button", {
+        key: "view-patches",
+        onClick: function () {
+          if (selectedInstanceId == null || !payload) return;
+          var inst = (payload.instances || [])
+            .find(function (i) { return i.instance_id === selectedInstanceId; });
+          if (!inst) return;
+          var tid = inst.tracking_id;
+          if (tid == null || tid === "") return;
+          var cam = cameraMirrorSlice || "image_02";
+          try {
+            viewPatchesOp.execute({
+              scene_name: selectedScene,
+              tracking_id: String(tid),
+              camera_slice: cam,
+            });
+          } catch (e) {
+            console.error("[bev-panel] view_track_patches throw", e);
+          }
+        },
+        disabled: selectedInstanceId == null,
+        title: selectedInstanceId == null
+          ? "Click a track on the BEV plot or timeline first"
+          : "Switch the App view to per-patch crops of the selected track",
+        style: {
+          background: selectedInstanceId != null ? "#2a4a6a" : "#333",
+          color: "#eee", border: "1px solid #444", borderRadius: 4,
+          padding: "4px 8px",
+          cursor: selectedInstanceId != null ? "pointer" : "not-allowed",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
+        },
+      }, "View patches"),
     ]);
 
     // ---- Body ----
@@ -1187,17 +1271,61 @@
     var chartH   = Math.max(320, Math.min(640, Math.round(availH * 0.55)));
     var timelineMaxH = Math.max(160, Math.min(360, Math.round(availH * 0.3)));
 
+    // Inline camera-mirror thumbnail: small image overlaid on the
+    // top-right of the BEV chart. URL comes from the operator-fetched
+    // cache, indexed by the scrubber's current frame_idx. The user
+    // picks which slice via the header dropdown; "(none)" hides it.
+    var camUrlMap = (camCacheKey && cameraUrlsCache[camCacheKey]) || null;
+    var camFrameUrl = (camUrlMap && scrubFrameIdx != null)
+      ? camUrlMap[String(scrubFrameIdx)] : null;
+    var thumbW = 240, thumbH = 144;  // 5:3 aspect — generous for 1242×375 KITTI
+
     var bevBlock = h("div", {
-      style: { padding: "12px 12px 8px" },
-    }, h(BEVChart, {
-      payload: payload, viewMode: viewMode,
-      currentFrameIdx: scrubFrameIdx,
-      selectedInstanceId: selectedInstanceId,
-      hoveredInstanceId: hoveredInstanceId,
-      onHoverInstance: setHoveredInstanceId,
-      onSelectInstance: setSelectedInstanceId,
-      width: contentW, height: chartH,
-    }));
+      style: { padding: "12px 12px 8px", position: "relative" },
+    }, [
+      h(BEVChart, {
+        key: "bev",
+        payload: payload, viewMode: viewMode,
+        currentFrameIdx: scrubFrameIdx,
+        selectedInstanceId: selectedInstanceId,
+        hoveredInstanceId: hoveredInstanceId,
+        onHoverInstance: setHoveredInstanceId,
+        onSelectInstance: setSelectedInstanceId,
+        width: contentW, height: chartH,
+      }),
+      camFrameUrl
+        ? h("div", {
+            key: "cam-thumb",
+            style: {
+              position: "absolute",
+              top: 14, right: 14,
+              width: thumbW, height: thumbH,
+              background: "#0a0a0a",
+              border: "1px solid #2c2c2c",
+              borderRadius: 3,
+              overflow: "hidden",
+              boxShadow: "0 2px 6px #0008",
+              pointerEvents: "none",  // clicks pass through to the chart
+            },
+            title: cameraMirrorSlice + " @ frame " + scrubFrameIdx,
+          }, [
+            h("img", {
+              key: "cam-img",
+              src: camFrameUrl,
+              style: { width: "100%", height: "100%", objectFit: "cover",
+                       display: "block" },
+            }),
+            h("div", {
+              key: "cam-lbl",
+              style: {
+                position: "absolute", left: 4, bottom: 2,
+                color: "#ddd", fontSize: 9, fontFamily: "ui-monospace, monospace",
+                textShadow: "0 0 3px #000, 0 0 3px #000",
+              },
+            }, cameraMirrorSlice + " · " + scrubFrameIdx),
+          ])
+        : null,
+    ]);
 
     var scrubberBlock = h("div", {
       style: { padding: "0 12px 6px" },

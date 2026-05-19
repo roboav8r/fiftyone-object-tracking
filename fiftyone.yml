@@ -12,4 +12,6 @@ panels:
 operators:
   - list_tracking_scenes
   - get_scene_track_payload
+  - get_camera_frame_urls
+  - view_track_patches
   - build_trajectories

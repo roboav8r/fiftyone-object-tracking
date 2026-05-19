@@ -452,10 +452,152 @@ class BuildTrajectories(foo.Operator):
 
 
 # -----------------------------------------------------------------------------
+# 4. get_camera_frame_urls — per-(scene, camera) image URLs by frame_idx
+# -----------------------------------------------------------------------------
+
+class GetCameraFrameUrls(foo.Operator):
+    """Return ``{frame_idx: media_url}`` for one camera slice of a scene.
+
+    Powers the BEV panel's inline camera-mirror thumbnail. JS fires this
+    when the user picks a camera slice; the result is cached client-side
+    and indexed by the current scrubber frame_idx to update the inline
+    image on every scrub.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="get_camera_frame_urls",
+            label="Get camera frame URLs",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("scene_name", required=True)
+        inputs.str("camera_slice", required=True)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        scene_name = ctx.params["scene_name"]
+        camera_slice = ctx.params["camera_slice"]
+        slices = list(ctx.dataset.group_slices or [])
+        if camera_slice not in slices:
+            return {
+                "scene_name": scene_name, "camera_slice": camera_slice,
+                "frame_urls": {},
+                "error": (
+                    f"slice {camera_slice!r} not in group_slices "
+                    f"{slices!r}"
+                ),
+            }
+        view = ctx.dataset.select_group_slices(camera_slice).match(
+            F("scene_name") == scene_name
+        ).sort_by("frame_idx")
+        frame_idxs, filepaths = view.values(["frame_idx", "filepath"])
+        # Resolve each filepath into a browser-loadable URL — fos.get_url
+        # returns a signed URL for gs:// / s3:// paths, or the raw path
+        # for already-HTTP / local FS paths. Cached client-side per
+        # (scene, slice); the JS layer doesn't re-fire unless the user
+        # changes either.
+        frame_urls = {}
+        for fi, fp in zip(frame_idxs, filepaths):
+            if fi is None or not fp:
+                continue
+            try:
+                url = fos.get_url(fp)
+            except Exception:
+                url = fp  # fallback; browser may not be able to load it
+            frame_urls[str(int(fi))] = url
+        return {
+            "scene_name": scene_name,
+            "camera_slice": camera_slice,
+            "frame_urls": frame_urls,
+        }
+
+
+# -----------------------------------------------------------------------------
+# 5. view_track_patches — apply a patches view filtered to one track
+# -----------------------------------------------------------------------------
+
+class ViewTrackPatches(foo.Operator):
+    """Switch the App view to one-patch-per-frame for a single track.
+
+    Builds ``ctx.dataset.select_group_slices(<camera_slice>).match(
+    scene_name == <scene>).to_patches('detections').match(
+    detections.tracking_id == <tid>)`` and triggers ``set_view`` to
+    apply it. JS fires this when the user clicks a track on the BEV
+    scene plot (or a timeline row) and clicks the "View patches"
+    button.
+
+    The resulting view in the App is a flat patches view where each
+    sample is a cropped bbox of the chosen track from one keyframe.
+    Useful for visual identity sanity-checks: scroll the grid +
+    confirm the track is the same physical object frame-to-frame.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="view_track_patches",
+            label="View track patches",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("scene_name", required=True)
+        inputs.str("tracking_id", required=True)
+        inputs.str("camera_slice", default="image_02")
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        scene_name = ctx.params["scene_name"]
+        tracking_id = ctx.params["tracking_id"]
+        camera_slice = ctx.params.get("camera_slice") or "image_02"
+
+        if camera_slice not in (ctx.dataset.group_slices or []):
+            return {"error": f"slice {camera_slice!r} not in dataset slices."}
+
+        # to_patches('detections') promotes each Detection embedded doc
+        # to a top-level "detections" field on the patches sample (NOT
+        # a flat per-field promotion), so the source-stamped
+        # tracking_id lives at "detections.tracking_id" rather than at
+        # the patch root. Match accordingly.
+        view = (
+            ctx.dataset.select_group_slices(camera_slice)
+                .match(F("scene_name") == scene_name)
+                .to_patches("detections")
+                .match(F("detections.tracking_id") == str(tracking_id))
+                .sort_by("sample_id")
+        )
+        n = view.count()
+        if n == 0:
+            return {
+                "error": (
+                    f"no patches for tracking_id={tracking_id!r} on "
+                    f"{camera_slice!r} in scene {scene_name!r}"
+                )
+            }
+
+        # Apply the view to the App. ctx.ops.set_view is the built-in
+        # mechanism to mutate the current App view from an operator.
+        ctx.ops.set_view(view=view)
+        return {
+            "scene_name": scene_name,
+            "tracking_id": str(tracking_id),
+            "camera_slice": camera_slice,
+            "n_patches": int(n),
+        }
+
+
+# -----------------------------------------------------------------------------
 # Plugin registration
 # -----------------------------------------------------------------------------
 
 def register(p):
     p.register(ListTrackingScenes)
     p.register(GetSceneTrackPayload)
+    p.register(GetCameraFrameUrls)
+    p.register(ViewTrackPatches)
     p.register(BuildTrajectories)
