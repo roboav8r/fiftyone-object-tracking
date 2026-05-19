@@ -24,4 +24,4 @@ ln -s "$PLUGIN_DIR" "$TARGET"
 echo "Symlinked: $PLUGIN_DIR -> $TARGET"
 echo
 echo "Restart the FiftyOne App (or 'fiftyone app debug') to pick up the plugin."
-echo "Verify with:  fiftyone plugins info @roboav8r/fiftyone-object-tracking-toolkit"
+echo "Verify with:  fiftyone plugins info @roboav8r/fiftyone-object-tracking"

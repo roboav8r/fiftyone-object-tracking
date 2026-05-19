@@ -74,7 +74,7 @@ dataset selector.
 
 ```bash
 fiftyone operators execute \
-    @roboav8r/fiftyone-object-tracking-toolkit/build_trajectories \
+    @roboav8r/fiftyone-object-tracking/build_trajectories \
     --params '{"source": "<source-tracking>",
                "target": "<target-trajectories>",
                "trajectory_root": "gs://your-bucket/derived/trajectories",
@@ -83,7 +83,7 @@ fiftyone operators execute \
 
 ```python
 import fiftyone.operators as foo
-op = foo.get_operator("@roboav8r/fiftyone-object-tracking-toolkit/build_trajectories")
+op = foo.get_operator("@roboav8r/fiftyone-object-tracking/build_trajectories")
 op({
     "source": "delivery-robot-tracking",
     "target": "delivery-robot-trajectories",
@@ -127,7 +127,7 @@ loader scripts in `fiftyone-tracking-loaders` do this correctly.
 
 ```
 fiftyone-object-tracking/
-├── fiftyone.yml          # plugin manifest (@roboav8r/fiftyone-object-tracking-toolkit)
+├── fiftyone.yml          # plugin manifest (@roboav8r/fiftyone-object-tracking)
 ├── __init__.py           # 3 operator classes + register()
 ├── _records.py           # TrajectoryRecord + build_track_records
 ├── _math.py              # SE(3) / quat helpers, gap stats, step velocities, …

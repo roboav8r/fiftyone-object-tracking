@@ -6,7 +6,7 @@
  *   window.__fop__, window.__mui__.
  *
  * Talks to the Python operators registered in __init__.py via
- * foo.useOperatorExecutor("@roboav8r/fiftyone-object-tracking-toolkit/<name>").
+ * foo.useOperatorExecutor("@roboav8r/fiftyone-object-tracking/<name>").
  *
  * Rendering is hand-rolled SVG (no chart libs). Layout:
  *
@@ -38,7 +38,7 @@
   var useRef    = React.useRef;
   var useCallback = React.useCallback;
 
-  var PLUGIN = "@roboav8r/fiftyone-object-tracking-toolkit";
+  var PLUGIN = "@roboav8r/fiftyone-object-tracking";
   var OP = function (name) { return PLUGIN + "/" + name; };
 
 
