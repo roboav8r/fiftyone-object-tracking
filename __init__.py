@@ -1,28 +1,24 @@
 """Operators for the FiftyOne object-tracking toolkit plugin.
 
-Four operators, exposed through ``register()``:
+Three operators, exposed through ``register()``:
 
-  - ``list_tracking_scenes``    — enumerate scenes + group-slice names
-                                  (consumed by the BEV panel)
-  - ``get_scene_track_payload`` — one-shot per-scene trajectory bundle
-                                  (consumed by ``BEVTrackVisualization``)
-  - ``read_trajectory_payload`` — per-sample parquet → JSON columns
-                                  (consumed by ``TrajectoryRenderer``)
-  - ``build_trajectories``      — build the per-trajectory FiftyOne
-                                  dataset from a grouped tracking
-                                  dataset. Listed; surfaces a form
-                                  in the App's operator browser.
-
-The first three are unlisted utilities for the JS UI. ``build_trajectories``
-is the only user-invoked operator; it takes a source dataset name, a
-target dataset name, a ``trajectory_root`` (where per-trajectory
-Parquet files land), and an ``overwrite`` flag.
+  - ``list_tracking_scenes``    (unlisted) — enumerate scenes +
+                                group-slice names for the BEV panel
+  - ``get_scene_track_payload`` (unlisted) — one-shot per-scene
+                                trajectory bundle for the BEV panel
+  - ``build_trajectories``      (listed)   — consume a grouped
+                                tracking dataset and emit a sibling
+                                per-trajectory dataset, with each
+                                trajectory rendered as a single BEV
+                                PNG by matplotlib. FO's built-in
+                                image renderer handles the grid +
+                                modal; no custom JS sample renderer
+                                and no PyArrow / Parquet roundtrip
+                                in the loop.
 """
 
 from __future__ import annotations
 
-import functools
-import io
 import math
 import os
 import shutil
@@ -39,16 +35,15 @@ from fiftyone import ViewField as F
 
 from ._records import (
     DEFAULT_EGO_SIZE_LWH,
-    PARQUET_COLUMNS,
     TrajectoryRecord,
     build_track_records,
-    write_trajectory_parquet,
 )
 from ._schema import (
     SAMPLE_SCHEMA,
     declare_schema,
     set_sidebar_groups,
 )
+from ._thumbnail import render_trajectory_thumbnail
 
 
 DEFAULT_LIDAR_SLICE = "lidar"
@@ -295,87 +290,7 @@ class GetSceneTrackPayload(foo.Operator):
 
 
 # -----------------------------------------------------------------------------
-# 3. read_trajectory_payload
-# -----------------------------------------------------------------------------
-
-@functools.lru_cache(maxsize=256)
-def _read_parquet_columns(filepath: str) -> dict[str, Any]:
-    """Read a trajectory parquet file and return the columns the JS
-    renderer needs. Cached so a scrolling grid only pays the I/O once."""
-    import pyarrow.parquet as pq
-
-    data = fos.read_file(filepath, binary=True)
-    table = pq.read_table(io.BytesIO(data))
-    raw_md = table.schema.metadata or {}
-    md = {
-        (k.decode() if isinstance(k, bytes) else k):
-        (v.decode() if isinstance(v, bytes) else v)
-        for k, v in raw_md.items()
-    }
-
-    def col(name: str) -> list:
-        if name not in table.column_names:
-            return []
-        return table.column(name).to_pylist()
-
-    return {
-        "color_hex": md.get("color_hex", "#cccccc"),
-        "schema_version": md.get("schema_version", "0"),
-        "x_base": col("x_base"),
-        "y_base": col("y_base"),
-        "x_scene_local": col("x_scene_local"),
-        "y_scene_local": col("y_scene_local"),
-        "fragment_ids": col("fragment_id"),
-    }
-
-
-class ReadTrajectoryPayload(foo.Operator):
-    @property
-    def config(self):
-        return foo.OperatorConfig(
-            name="read_trajectory_payload",
-            label="Read trajectory payload",
-            unlisted=True,
-        )
-
-    def resolve_input(self, ctx):
-        inputs = types.Object()
-        inputs.str("sample_id", required=True)
-        return types.Property(inputs)
-
-    def execute(self, ctx) -> dict[str, Any]:
-        sample_id = ctx.params["sample_id"]
-        # The App's modal surface passes "<id>-modal" through to the
-        # renderer; strip the suffix so ctx.dataset[...] still resolves.
-        if isinstance(sample_id, str) and sample_id.endswith("-modal"):
-            sample_id = sample_id[: -len("-modal")]
-        try:
-            sample = ctx.dataset[sample_id]
-        except KeyError:
-            return {"error": f"Sample {sample_id!r} not found."}
-
-        filepath = sample.filepath
-        if not filepath or not filepath.endswith(".parquet"):
-            return {
-                "error": f"Sample filepath is not a parquet file: {filepath!r}",
-            }
-
-        ego_size = list(
-            (ctx.dataset.info or {}).get("ego_size_lwh_m")
-            or DEFAULT_EGO_SIZE_LWH
-        )
-
-        try:
-            payload = dict(_read_parquet_columns(filepath))
-        except Exception as e:
-            return {"error": f"Failed to read {filepath}: {e!r}"}
-
-        payload["ego_size_lwh_m"] = ego_size
-        return payload
-
-
-# -----------------------------------------------------------------------------
-# 4. build_trajectories — the user-facing operator
+# 3. build_trajectories — the user-facing operator
 # -----------------------------------------------------------------------------
 
 def _record_to_sample(record: TrajectoryRecord, filepath: str) -> fo.Sample:
@@ -398,7 +313,13 @@ def _create_or_overwrite(name: str, overwrite: bool) -> fo.Dataset:
 def _build_trajectories(
     *, source: str, target: str, trajectory_root: str, overwrite: bool,
 ) -> fo.Dataset:
-    """Core build logic; the operator wraps this."""
+    """Core build logic; the operator wraps this.
+
+    Each trajectory is rendered to a single PNG (BEV plot) via
+    matplotlib at build time; ``sample.filepath`` points at the PNG
+    and FO's built-in image renderer handles the grid + modal. No
+    PyArrow / Parquet / custom JS renderer in the loop.
+    """
     src = fo.load_dataset(source)
     tgt = _create_or_overwrite(target, overwrite=overwrite)
     declare_schema(tgt)
@@ -421,13 +342,11 @@ def _build_trajectories(
         ],
         "quadrants_base": ["front_left", "front_right", "back_left", "back_right"],
         "trajectory_root": trajectory_root,
-        "parquet_columns": PARQUET_COLUMNS,
-        "parquet_schema_version": "2",
     }
     tgt.save()
 
     tmpdir = tempfile.mkdtemp(prefix=f"trajectories-{target}-")
-    print(f"[build_trajectories] writing Parquet files to {tmpdir}")
+    print(f"[build_trajectories] rendering BEV thumbnails to {tmpdir}")
 
     samples: list[fo.Sample] = []
     for scene_name in scenes:
@@ -444,8 +363,10 @@ def _build_trajectories(
               f"ego={'yes' if ego_record else 'no'} "
               f"objects={len(object_records)} (total {len(records)})")
         for record in records:
-            local_path = os.path.join(tmpdir, record.parquet_basename)
-            write_trajectory_parquet(record, local_path)
+            local_path = os.path.join(tmpdir, f"{record.output_stem}.png")
+            render_trajectory_thumbnail(
+                record, local_path, ego_size_lwh=tuple(ego_size),
+            )
             samples.append(_record_to_sample(record, local_path))
 
     print(f"[build_trajectories] adding {len(samples)} samples to {target}")
@@ -453,7 +374,7 @@ def _build_trajectories(
     tgt.compute_metadata()
 
     remote_dir = f"{trajectory_root.rstrip('/')}/{target}"
-    print(f"[build_trajectories] copying Parquet files to {remote_dir}")
+    print(f"[build_trajectories] uploading thumbnails to {remote_dir}")
     fos.upload_media(tgt, remote_dir, update_filepaths=True, overwrite=True)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -537,5 +458,4 @@ class BuildTrajectories(foo.Operator):
 def register(p):
     p.register(ListTrackingScenes)
     p.register(GetSceneTrackPayload)
-    p.register(ReadTrajectoryPayload)
     p.register(BuildTrajectories)

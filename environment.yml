@@ -18,11 +18,10 @@ dependencies:
   - pip
   - pip:
       - python-dotenv
-      # Operator runtime deps:
+      # Operator runtime deps (all already in the FOE base image).
       - numpy
       - scipy
-      - pandas
-      - pyarrow
+      - matplotlib
       # Pin starlette under FOE's compatibility ceiling (FOE SDK still
       # uses on_event); newer Starlette removed it.
       - "starlette<0.36"

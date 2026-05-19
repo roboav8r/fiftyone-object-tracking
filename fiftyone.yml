@@ -12,5 +12,4 @@ panels:
 operators:
   - list_tracking_scenes
   - get_scene_track_payload
-  - read_trajectory_payload
   - build_trajectories

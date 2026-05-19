@@ -1,14 +1,18 @@
-"""Per-trajectory record + Parquet writer used by the build operator.
+"""Per-trajectory record builder used by the build operator.
 
 Consumes a per-frame canonical grouped-tracking dataset (cuboids on the
 lidar slice, ``world_to_base`` SE(3) per frame, source-side identity
 stamped on each Detection) and emits one ``TrajectoryRecord`` per
 (scene, FO instance) plus one ego record per scene.
+
+Per-frame arrays are kept in-memory on the ``TrajectoryRecord``; the
+build operator hands the record to ``_thumbnail.render_trajectory_thumbnail``
+which uses matplotlib to write a PNG to disk. No PyArrow / Parquet
+dependency.
 """
 
 from __future__ import annotations
 
-import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -28,7 +32,6 @@ from ._math import (
     step_velocities,
     timestamps_to_seconds,
 )
-from ._palette import color_for
 
 
 # Default ego footprint (OSDaR23-style rail vehicle). Each dataset
@@ -43,9 +46,10 @@ class TrajectoryRecord:
 
     Per-frame arrays (``translations_*``, ``rotations_*``, ``sizes``,
     ``velocities_world``, ``tracking_scores``, ``num_pts``,
-    ``fragment_ids``) are written to a Parquet file at
-    ``parquet_basename``; all other fields are sample-level scalars
-    surfaced via the FiftyOne App sidebar.
+    ``fragment_ids``) are kept in-memory and consumed by
+    ``_thumbnail.render_trajectory_thumbnail`` at build time. All
+    other fields are sample-level scalars surfaced via the FiftyOne
+    App sidebar.
     """
 
     # identity / back-links
@@ -120,7 +124,8 @@ class TrajectoryRecord:
     bbox_world_x_max: float
     bbox_world_y_max: float
 
-    # per-frame arrays — written to Parquet, not the FO sample
+    # per-frame arrays — kept in-memory; matplotlib renders the BEV
+    # thumbnail at build time, no external trajectory file written.
     frame_indices: np.ndarray
     timestamps_ns: list[Optional[str]]
     timestamps_s: np.ndarray
@@ -136,86 +141,10 @@ class TrajectoryRecord:
     tracking_scores: np.ndarray
     num_pts: np.ndarray
     fragment_ids: np.ndarray
-    parquet_basename: str
-
-
-PARQUET_COLUMNS = [
-    "frame_idx", "timestamp_s", "timestamp_ns", "sample_token",
-    "x_base", "y_base", "z_base",
-    "x_world", "y_world", "z_world",
-    "x_scene_local", "y_scene_local", "z_scene_local",
-    "x_origin_norm", "y_origin_norm",
-    "qx_base", "qy_base", "qz_base", "qw_base",
-    "qx_world", "qy_world", "qz_world", "qw_world",
-    "l", "w", "h",
-    "vx_world", "vy_world",
-    "tracking_score", "num_pts",
-    "fragment_id",
-]
-
-
-def write_trajectory_parquet(record: TrajectoryRecord, outpath: str) -> None:
-    """Write per-frame trajectory data to a Parquet file (zstd-compressed).
-
-    Column order matches :data:`PARQUET_COLUMNS` (stable so the JS
-    custom renderer can hard-code it). Identity metadata is also
-    written as Arrow schema KV so the file is self-describing.
-    """
-    import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    n = record.frame_indices.shape[0]
-    df = pd.DataFrame({
-        "frame_idx": record.frame_indices.astype("int64"),
-        "timestamp_s": record.timestamps_s.astype("float64"),
-        "timestamp_ns": [s if s is not None else "" for s in record.timestamps_ns],
-        "sample_token": list(record.sample_tokens),
-        "x_base": record.translations_base[:, 0],
-        "y_base": record.translations_base[:, 1],
-        "z_base": record.translations_base[:, 2],
-        "x_world": record.translations_world[:, 0],
-        "y_world": record.translations_world[:, 1],
-        "z_world": record.translations_world[:, 2],
-        "x_scene_local": record.translations_scene_local[:, 0],
-        "y_scene_local": record.translations_scene_local[:, 1],
-        "z_scene_local": record.translations_scene_local[:, 2],
-        "x_origin_norm": record.translations_origin_normalized[:, 0],
-        "y_origin_norm": record.translations_origin_normalized[:, 1],
-        "qx_base": record.rotations_base[:, 0],
-        "qy_base": record.rotations_base[:, 1],
-        "qz_base": record.rotations_base[:, 2],
-        "qw_base": record.rotations_base[:, 3],
-        "qx_world": record.rotations_world[:, 0],
-        "qy_world": record.rotations_world[:, 1],
-        "qz_world": record.rotations_world[:, 2],
-        "qw_world": record.rotations_world[:, 3],
-        "l": record.sizes[:, 0],
-        "w": record.sizes[:, 1],
-        "h": record.sizes[:, 2],
-        "vx_world": record.velocities_world[:, 0],
-        "vy_world": record.velocities_world[:, 1],
-        "tracking_score": record.tracking_scores,
-        "num_pts": record.num_pts,
-        "fragment_id": record.fragment_ids.astype("int32"),
-    })[PARQUET_COLUMNS]
-    assert len(df) == n
-
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    table = table.replace_schema_metadata({
-        "kind": record.kind,
-        "instance_id": record.instance_id,
-        "tracking_id": record.tracking_id,
-        "segment_index": str(record.segment_index),
-        "class_run_idx": str(record.class_run_idx),
-        "tracking_name": record.tracking_name,
-        "scene_name": record.scene_name,
-        "source_dataset": record.source_dataset,
-        "color_hex": color_for(record.tracking_name),
-        "schema_version": "2",
-    })
-    os.makedirs(os.path.dirname(outpath) or ".", exist_ok=True)
-    pq.write_table(table, outpath, compression="zstd")
+    # Filename stem (no extension) for the build operator's
+    # per-trajectory PNG. The operator appends ``.png`` and writes
+    # the file via matplotlib.
+    output_stem: str
 
 
 # -----------------------------------------------------------------------------
@@ -360,7 +289,7 @@ def _record_from_object(
         tracking_scores=np.full(frame_indices.shape[0], -1.0, dtype=np.float64),
         num_pts=np.full(frame_indices.shape[0], -1, dtype=np.int64),
         fragment_ids=fragment_ids,
-        parquet_basename=f"{scene_name}__object__{instance_id}.parquet",
+        output_stem=f"{scene_name}__object__{instance_id}",
     )
 
 
@@ -482,7 +411,7 @@ def _record_from_ego(
         tracking_scores=np.full(frame_indices.shape[0], -1.0, dtype=np.float64),
         num_pts=np.full(frame_indices.shape[0], -1, dtype=np.int64),
         fragment_ids=fragment_ids,
-        parquet_basename=f"{scene_name}__ego__ego.parquet",
+        output_stem=f"{scene_name}__ego__ego",
     )
 
 

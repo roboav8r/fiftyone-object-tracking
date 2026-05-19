@@ -3,16 +3,16 @@
 FiftyOne plugin for working with grouped 3D tracking datasets:
 
 - **Build per-trajectory datasets** from a tracking source via the
-  `build_trajectories` operator. Each trajectory sample is a Parquet
-  payload + ~50 filter-friendly scalar facets grouped under
+  `build_trajectories` operator. Each trajectory sample is a single
+  PNG (BEV plot rendered server-side with matplotlib at build time:
+  forward up, left to the left, start `o`, end `x`, ego rectangle at
+  origin) plus ~50 filter-friendly scalar facets grouped under
   `Identity` / `Coverage` / `Position (base)` / `Position (world)` /
-  `Motion` / `Shape` / `QC`.
+  `Motion` / `Shape` / `QC`. FO's built-in image renderer handles
+  the grid + modal — no custom JS sample renderer.
 - **`BEVTrackVisualization` panel** — per-scene bird's-eye-view of
   object trajectories with a timeline scrubber, base ↔ world toggle,
   per-instance presence rows, and pan / zoom.
-- **`TrajectoryRenderer` custom sample renderer** — renders per-cell
-  BEV plots for the trajectories dataset's Parquet samples in the
-  App grid + modal (start marked with **o**, end with **x**).
 
 Source datasets are produced by a separate, private dataloaders repo
 (one loader per source format, each emitting the canonical
@@ -39,127 +39,9 @@ cd fiftyone-object-tracking-plugin
 
 ### Python runtime dependencies
 
-The plugin's operators need `numpy`, `scipy`, `pandas`, and `pyarrow`
-(see `requirements.txt`). `numpy` / `scipy` / `pandas` are already in
-the FOE base image; **`pyarrow` is not** and must be installed into
-every service that executes plugin operator code.
-
-If `pyarrow` is missing, the `read_trajectory_payload` operator will
-fail with `ModuleNotFoundError("No module named 'pyarrow'")` and the
-`TrajectoryRenderer` grid cells will show that error instead of the
-BEV plot.
-
-#### Which services need pyarrow?
-
-FiftyOne Teams runs plugin Python in **multiple** services:
-
-| Service | Role | Needs `pyarrow`? |
-|---|---|---|
-| `fiftyone-app` | App-server-side operator execution for non-Teams installs | yes |
-| `teams-plugins` | Synchronous plugin-operator execution (Teams) | **yes** (this is where `read_trajectory_payload` runs in your deployment) |
-| `teams-do` (× N replicas) | Delegated-operator workers | yes (if you'll ever run `build_trajectories` in delegated mode) |
-| `teams-api` | Teams API server | optional today, but recommended for future-proofing |
-| `teams-app` | React UI image; no Python operators | no |
-| `teams-cas` | Auth service | no |
-
-The exact service names depend on your compose project / helm release.
-
-#### Quick check (any deployment)
-
-```bash
-# Run against each FOE Python service to confirm pyarrow is reachable
-docker exec <service-container> python -c "import pyarrow; print(pyarrow.__version__)"
-# (or, in a helm pod:)
-kubectl exec -n <namespace> <pod> -- python -c "import pyarrow; print(pyarrow.__version__)"
-```
-
-#### Quick fix (short-lived)
-
-Drop pyarrow into running containers / pods. **Reverted on next
-container restart**, so this is for testing only:
-
-```bash
-# Docker Compose
-for c in <project>-fiftyone-app-1 <project>-teams-plugins-1 \
-         <project>-teams-do-1 <project>-teams-do-2 <project>-teams-do-3 \
-         <project>-teams-api-1; do
-    docker exec "$c" pip install --no-cache-dir pyarrow
-done
-
-# Helm / Kubernetes
-for pod in $(kubectl get pods -n <ns> -l app.kubernetes.io/name=fiftyone -o name); do
-    kubectl exec -n <ns> "$pod" -- pip install --no-cache-dir pyarrow
-done
-```
-
-#### Durable fix — bake into a custom image (recommended)
-
-Build an image FROM the FOE base, add `pyarrow`, and point the
-operator-running services at that image. Survives container
-recreation, helm upgrades, etc.
-
-**Dockerfile** (next to your compose.yaml):
-
-```dockerfile
-# Dockerfile.fiftyone-with-pyarrow
-ARG FIFTYONE_VERSION
-FROM voxel51/fiftyone-app:${FIFTYONE_VERSION}
-RUN pip install --no-cache-dir pyarrow
-```
-
-**Docker Compose** — override the image for every Python-running service:
-
-```yaml
-# compose.override.yaml
-services:
-  fiftyone-app: &with-pyarrow
-    build:
-      context: .
-      dockerfile: Dockerfile.fiftyone-with-pyarrow
-      args:
-        FIFTYONE_VERSION: "2.18.0"   # match your deployment
-    image: local/fiftyone-app-with-pyarrow:2.18.0
-  teams-plugins:
-    <<: *with-pyarrow
-  teams-do:
-    <<: *with-pyarrow
-
-# then
-docker compose build
-docker compose up -d
-```
-
-**Helm** — push the custom image to a registry the cluster can reach,
-then override the image in `values.yaml` for the relevant services
-(the exact key names depend on your chart version; check `helm show
-values voxel51/fiftyone-teams-app`):
-
-```yaml
-# values.yaml
-apiSettings:
-  image:
-    repository: my-registry/fiftyone-app-with-pyarrow
-    tag: 2.18.0
-pluginsSettings:                  # for Teams; key sometimes named teamsPlugins
-  image:
-    repository: my-registry/fiftyone-app-with-pyarrow
-    tag: 2.18.0
-delegatedOperatorExecutorSettings: # key sometimes teamsDo / delegatedOperator
-  image:
-    repository: my-registry/fiftyone-app-with-pyarrow
-    tag: 2.18.0
-appSettings:
-  image:
-    repository: my-registry/fiftyone-app-with-pyarrow
-    tag: 2.18.0
-
-# then
-helm upgrade --install fiftyone voxel51/fiftyone-teams-app -f values.yaml
-```
-
-If your chart exposes a `extraEnvFrom` or `initContainers` hook
-instead, an init container that runs `pip install pyarrow` against a
-shared volume can work but is fiddlier than rebuilding the image.
+The plugin's operators use `numpy`, `scipy`, and `matplotlib` — all
+already shipped with the FOE base image. No additional `pip install`
+step on the deployment.
 
 ## What it expects on the source dataset
 
@@ -212,11 +94,12 @@ op({
 
 ### Browse trajectories in the App
 
-After build, open the trajectories dataset. The custom
-`TrajectoryRenderer` draws a BEV thumbnail per cell (forward up,
-left to the left, `o` at the trajectory start, `x` at the end). The
-sidebar exposes ~50 filter facets in 7 groups, including the **QC**
-group:
+After build, open the trajectories dataset. Each cell is a static
+PNG (rendered server-side by matplotlib at build time, served by
+FO's built-in image renderer) showing the trajectory in BEV —
+forward up, left to the left, `o` at the trajectory start, `x` at
+the end, faint ego rectangle at origin. The sidebar exposes ~50
+filter facets in 7 groups, including the **QC** group:
 
 | Field | Type | What it surfaces |
 |---|---|---|
@@ -245,14 +128,15 @@ loader scripts in `fiftyone-tracking-loaders` do this correctly.
 ```
 fiftyone-object-tracking-plugin/
 ├── fiftyone.yml          # plugin manifest (@roboav8r/fiftyone-object-tracking-toolkit)
-├── __init__.py           # 4 operator classes + register()
-├── _records.py           # TrajectoryRecord + build_track_records + parquet writer
+├── __init__.py           # 3 operator classes + register()
+├── _records.py           # TrajectoryRecord + build_track_records
 ├── _math.py              # SE(3) / quat helpers, gap stats, step velocities, …
 ├── _schema.py            # SAMPLE_SCHEMA + SIDEBAR_GROUPS + helpers
 ├── _palette.py           # class → hex color
-├── dist/index.umd.js     # BEV panel + TrajectoryRenderer (hand-written UMD)
+├── _thumbnail.py         # matplotlib BEV-thumbnail renderer
+├── dist/index.umd.js     # BEV panel (hand-written UMD)
 ├── environment.yml       # dev conda env
-├── requirements.txt      # runtime python deps
+├── requirements.txt      # runtime python deps (numpy / scipy / matplotlib)
 ├── install.sh            # local-dev symlink helper
 ├── README.md
 └── LICENSE
@@ -269,5 +153,4 @@ Slots reserved for future tracking-specific operators in this plugin:
 - `flag_qc_outliers` — auto-tag trajectories above configurable
   thresholds on the QC fields.
 - `evaluate_predicted_tracks` — GT-vs-predicted track evaluation
-  (nuScenes-style; the trajectory parquet schema is already a strict
-  superset of nuScenes `TrackingBox`).
+  (nuScenes-style).

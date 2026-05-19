@@ -1546,20 +1546,10 @@
     },
   });
 
-  fop.registerComponent({
-    name: "TrajectoryRenderer",
-    label: "Trajectory BEV renderer",
-    component: TrajectoryRenderer,
-    type: fop.PluginComponentType.SampleRenderer,
-    activator: function () { return true; },
-    sampleRendererOptions: {
-      priority: 100,
-      supports: {
-        extensions: [".parquet"],
-        mediaTypes: ["unknown"],
-      },
-      grid: { enabled: true },
-      modal: { enabled: true },
-    },
-  });
+  // TrajectoryRenderer has been removed — the trajectories dataset
+  // now ships server-rendered PNGs as sample.filepath and FO's
+  // built-in image renderer handles the grid + modal. The
+  // TrajectoryRenderer function above is unused but kept for
+  // reference (and in case interactive rendering is added back as an
+  // opt-in later).
 })();
