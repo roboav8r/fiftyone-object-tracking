@@ -1,4 +1,4 @@
-# fiftyone-object-tracking-plugin
+# fiftyone-object-tracking
 
 FiftyOne plugin for working with grouped 3D tracking datasets:
 
@@ -26,14 +26,14 @@ Into a FiftyOne Enterprise deployment:
 
 ```bash
 fiftyone plugins download \
-    https://github.com/roboav8r/fiftyone-object-tracking-plugin
+    https://github.com/roboav8r/fiftyone-object-tracking
 ```
 
 For local development, symlink the repo into your plugins dir:
 
 ```bash
-git clone https://github.com/roboav8r/fiftyone-object-tracking-plugin
-cd fiftyone-object-tracking-plugin
+git clone https://github.com/roboav8r/fiftyone-object-tracking
+cd fiftyone-object-tracking
 ./install.sh   # symlinks into ~/fiftyone/__plugins__/
 ```
 
@@ -126,7 +126,7 @@ loader scripts in `fiftyone-tracking-loaders` do this correctly.
 ## Layout
 
 ```
-fiftyone-object-tracking-plugin/
+fiftyone-object-tracking/
 ├── fiftyone.yml          # plugin manifest (@roboav8r/fiftyone-object-tracking-toolkit)
 ├── __init__.py           # 3 operator classes + register()
 ├── _records.py           # TrajectoryRecord + build_track_records

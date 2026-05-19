@@ -5,12 +5,12 @@
 # deployment via:
 #
 #   fiftyone plugins download \
-#       https://github.com/roboav8r/fiftyone-object-tracking-plugin
+#       https://github.com/roboav8r/fiftyone-object-tracking
 #
 # Create:   mamba env create -f environment.yml
-# Activate: mamba activate fiftyone-object-tracking-plugin
+# Activate: mamba activate fiftyone-object-tracking
 
-name: fiftyone-object-tracking-plugin
+name: fiftyone-object-tracking
 channels:
   - conda-forge
 dependencies:
