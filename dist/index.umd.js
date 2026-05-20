@@ -244,7 +244,7 @@
     var payload = props.payload;
     var viewMode = props.viewMode;
     var currentFrameIdx = props.currentFrameIdx;
-    var selectedInstanceId = props.selectedInstanceId;
+    var selectedInstanceIds = props.selectedInstanceIds;
     var hoveredInstanceId = props.hoveredInstanceId;
     var onHoverInstance = props.onHoverInstance;
     var onSelectInstance = props.onSelectInstance;
@@ -375,7 +375,7 @@
       if (hoveredInstanceId) onHoverInstance && onHoverInstance(null);
     }
 
-    function handleClick() {
+    function handleClick(e) {
       // If a pan just ended (mouse moved >2 px while middle-down), suppress
       // the click-as-selection event that would otherwise fire on mouseup.
       if (suppressClickRef.current) {
@@ -383,7 +383,11 @@
         return;
       }
       if (hoveredInstanceId !== undefined) {
-        onSelectInstance && onSelectInstance(hoveredInstanceId);
+        // Ctrl/Cmd-click toggles the track in the multi-selection;
+        // plain click replaces the selection with just the clicked
+        // track. The parent (BEVPanel) interprets the flag.
+        var additive = !!(e && (e.metaKey || e.ctrlKey || e.shiftKey));
+        onSelectInstance && onSelectInstance(hoveredInstanceId, additive);
       }
     }
 
@@ -444,7 +448,7 @@
       if (!bw || !bw.x.length || !inst.frames) return;
       var color = instanceColor(inst.label, inst.instance_id);
       var isHover = inst.instance_id === hoveredInstanceId;
-      var isSel   = inst.instance_id === selectedInstanceId;
+      var isSel   = selectedInstanceIds && selectedInstanceIds.has(inst.instance_id);
       var solidWidth = isHover || isSel ? 2.5 : 1.0;
       var solidAlpha = isSel ? 1.0 : (isHover ? 0.9 : 0.55);
 
@@ -500,7 +504,7 @@
       if (!bw) return;
       var color = instanceColor(inst.label, inst.instance_id);
       var isHover = inst.instance_id === hoveredInstanceId;
-      var isSel   = inst.instance_id === selectedInstanceId;
+      var isSel   = selectedInstanceIds && selectedInstanceIds.has(inst.instance_id);
 
       var idx = inst.frames.indexOf(currentFrameIdx);
       var isLive = idx >= 0;
@@ -768,7 +772,7 @@
     var payload = props.payload;
     var currentFrameIdx = props.currentFrameIdx;
     var hoveredInstanceId = props.hoveredInstanceId;
-    var selectedInstanceId = props.selectedInstanceId;
+    var selectedInstanceIds = props.selectedInstanceIds;
     var onHoverInstance = props.onHoverInstance;
     var onSelectInstance = props.onSelectInstance;
     var width = props.width || 800;
@@ -809,7 +813,7 @@
     var rows = instances.map(function (inst) {
       var color = instanceColor(inst.label, inst.instance_id);
       var isHover = inst.instance_id === hoveredInstanceId;
-      var isSel   = inst.instance_id === selectedInstanceId;
+      var isSel   = selectedInstanceIds && selectedInstanceIds.has(inst.instance_id);
 
       // Build run rectangles in pixel space.
       var runs = contiguousRuns(inst.frames || []);
@@ -836,8 +840,12 @@
         key: "row-" + inst.instance_id,
         onMouseEnter: function () { onHoverInstance && onHoverInstance(inst.instance_id); },
         onMouseLeave: function () { onHoverInstance && onHoverInstance(null); },
-        onClick: function () {
-          onSelectInstance && onSelectInstance(isSel ? null : inst.instance_id);
+        onClick: function (e) {
+          // Ctrl/Cmd/Shift-click adds/toggles this track in the
+          // multi-selection; plain click replaces. The parent
+          // interprets the additive flag.
+          var additive = !!(e && (e.metaKey || e.ctrlKey || e.shiftKey));
+          onSelectInstance && onSelectInstance(inst.instance_id, additive);
         },
         style: {
           display: "flex", alignItems: "center", height: rowHeight + 2,
@@ -948,7 +956,27 @@
     var [viewMode, setViewMode] = useState("base");      // "base" | "world"
     var [scrubFrameIdx, setScrubFrameIdx] = useState(null);
     var [hoveredInstanceId, setHoveredInstanceId] = useState(null);
-    var [selectedInstanceId, setSelectedInstanceId] = useState(null);
+    // Set of FO instance hexes the user has selected on the BEV
+    // panel. Plain click → set-of-one (replace); Ctrl/Cmd/Shift-click
+    // → toggle the clicked track in/out of the existing set.
+    var [selectedInstanceIds, setSelectedInstanceIds] = useState(new Set());
+    var handleSelectInstance = useCallback(function (id, additive) {
+      if (id == null) { setSelectedInstanceIds(new Set()); return; }
+      if (additive) {
+        setSelectedInstanceIds(function (prev) {
+          var next = new Set(prev);
+          if (next.has(id)) next.delete(id); else next.add(id);
+          return next;
+        });
+      } else {
+        setSelectedInstanceIds(function (prev) {
+          // Plain click on the already-sole-selected track toggles
+          // it off; otherwise replace selection with just that track.
+          if (prev && prev.size === 1 && prev.has(id)) return new Set();
+          return new Set([id]);
+        });
+      }
+    }, []);
     // Which group slice the inline camera thumbnail mirrors. Default
     // "image_02" for KITTI/multi-camera datasets; user can change in
     // the header dropdown. Set to null to hide the thumbnail.
@@ -1225,38 +1253,43 @@
           ])
         : null,
 
-      // View patches button — fires view_track_patches against the
+      // View patches button — fires view_track_patches against every
       // currently-selected track. Filters by FO Instance hex
-      // (dataset-agnostic; the source-side tracking_id field name +
-      // type varies across loaders and external datasets). Defaults
-      // to flattening across ALL non-lidar group slices, so the
-      // resulting App grid shows patches from every camera at once.
+      // (dataset-agnostic). Defaults to flattening across ALL
+      // non-lidar group slices and ordering by frame_idx so the
+      // resulting App grid shows temporally-ordered patches across
+      // every camera. Ctrl/Cmd-click a track to add it to the
+      // selection; the button caption shows the count.
       h("button", {
         key: "view-patches",
         onClick: function () {
-          if (selectedInstanceId == null || !selectedScene) return;
+          if (!selectedInstanceIds || selectedInstanceIds.size === 0
+              || !selectedScene) return;
           try {
             viewPatchesOp.execute({
               scene_name: selectedScene,
-              instance_id: String(selectedInstanceId),
-              // camera_slices omitted → operator auto-picks every
-              // non-lidar slice; user can re-filter via App slice
-              // picker on the resulting patches view if needed.
+              instance_ids: Array.from(selectedInstanceIds),
             });
           } catch (e) {
             console.error("[bev-panel] view_track_patches throw", e);
           }
         },
-        disabled: selectedInstanceId == null,
-        title: selectedInstanceId == null
-          ? "Click a track on the BEV plot or timeline first"
-          : "Switch the App view to per-patch crops of the selected "
-            + "track across all camera slices",
+        disabled: !selectedInstanceIds || selectedInstanceIds.size === 0,
+        title: (!selectedInstanceIds || selectedInstanceIds.size === 0)
+          ? "Click a track on the BEV plot or timeline first "
+            + "(Ctrl/Cmd-click to add more)"
+          : "Switch the App view to per-patch crops of the "
+            + (selectedInstanceIds.size === 1
+                 ? "selected track"
+                 : "selected " + selectedInstanceIds.size + " tracks")
+            + " across all camera slices, ordered by frame_idx",
         style: {
-          background: selectedInstanceId != null ? "#2a4a6a" : "#333",
+          background: (selectedInstanceIds && selectedInstanceIds.size > 0)
+            ? "#2a4a6a" : "#333",
           color: "#eee", border: "1px solid #444", borderRadius: 4,
           padding: "4px 8px",
-          cursor: selectedInstanceId != null ? "pointer" : "not-allowed",
+          cursor: (selectedInstanceIds && selectedInstanceIds.size > 0)
+            ? "pointer" : "not-allowed",
           fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
         },
       }, "View patches"),
@@ -1287,10 +1320,10 @@
         key: "bev",
         payload: payload, viewMode: viewMode,
         currentFrameIdx: scrubFrameIdx,
-        selectedInstanceId: selectedInstanceId,
+        selectedInstanceIds: selectedInstanceIds,
         hoveredInstanceId: hoveredInstanceId,
         onHoverInstance: setHoveredInstanceId,
-        onSelectInstance: setSelectedInstanceId,
+        onSelectInstance: handleSelectInstance,
         width: contentW, height: chartH,
       }),
       camFrameUrl
@@ -1343,9 +1376,9 @@
       payload: payload,
       currentFrameIdx: scrubFrameIdx,
       hoveredInstanceId: hoveredInstanceId,
-      selectedInstanceId: selectedInstanceId,
+      selectedInstanceIds: selectedInstanceIds,
       onHoverInstance: setHoveredInstanceId,
-      onSelectInstance: setSelectedInstanceId,
+      onSelectInstance: handleSelectInstance,
       width: contentW,
       maxHeight: timelineMaxH,
     }));

@@ -521,40 +521,46 @@ class GetCameraFrameUrls(foo.Operator):
 # -----------------------------------------------------------------------------
 
 class ViewTrackPatches(foo.Operator):
-    """Switch the App view to one-patch-per-frame for a single track.
+    """Switch the App view to one-patch-per-detection for one or more tracks.
 
     Flattens the dataset across one or more camera slices, filters to
-    a single scene + ``fo.Instance.id`` (the FO-side cross-frame
-    identifier shared by every Detection of the same track), and
-    applies the resulting patches view via ``ctx.ops.set_view``.
+    a single scene + a set of FO ``Instance.id`` values (the FO-side
+    cross-frame identifier shared by every Detection of the same
+    track), sorts the resulting patches by a configurable order
+    field, and applies the view via ``ctx.ops.set_view``.
 
     Why ``instance._id`` instead of the source-side ``tracking_id``?
-    The source-side field name is dataset-specific (``tracking_id``
-    for our loaders, but e.g. KITTI uses ``track_id``, public MOT
-    benchmarks use other names) AND can be stored as different types
-    (str vs int). The FO ``Instance`` id is dataset-agnostic and the
-    same for all of a track's Detections regardless of loader. JS
-    already has the selected track's instance hex (it's how the BEV
-    panel highlights selected tracks), so the operator stays clean.
+    The source-side field name varies across loaders + external
+    datasets and its storage type isn't uniform (str vs int). The FO
+    ``Instance`` id is dataset-agnostic and the same for all of a
+    track's Detections regardless of loader. The BEV panel passes
+    the selected instance hexes directly.
 
-    Advanced users can override via ``match_field`` + ``match_value``
-    to filter by any other Detection-level field (e.g.
-    ``"detections.tracking_id"`` or a custom dynamic field).
+    The scene-match field and the post-flatten order field are both
+    configurable so this operator works against datasets that use a
+    different schema (``sequence``/``run`` instead of ``scene_name``;
+    ``frame_number``/``timestamp_s`` instead of ``frame_idx``).
 
     Inputs:
-      scene_name: str — required.
-      instance_id: str — required FO ``fo.Instance`` hex; the
-        ``ObjectId`` form of ``detection.instance._id``. JS passes
-        this directly from the panel's ``selectedInstanceId`` state.
+      scene_name: str — required value to filter the scene field on.
+      scene_field: str (default ``"scene_name"``) — the sample-level
+        string field that holds the scene/run/sequence identifier.
+      instance_ids: list[str] — one FO ``Instance`` hex per track to
+        include. ``instance_id`` (singular str) is also accepted as a
+        single-track shortcut for backwards-compat.
       camera_slices: list[str] (or comma-separated string) —
         optional. When omitted/empty, the operator auto-picks every
         non-lidar group slice (i.e. all cameras). ``camera_slice``
-        (singular str) is also accepted as a single-slice shortcut.
+        (singular str) is also accepted.
+      order_field: str (default ``"frame_idx"``) — sample-level field
+        the patches view is sorted by. Preserved on the patches via
+        ``to_patches(other_fields=[order_field])``. Set to empty
+        string to skip sorting.
       match_field, match_value: optional advanced override. When set,
         replaces the ``detections.instance._id`` match with
-        ``F(match_field) == match_value`` (or its int form if it
-        parses). Useful for filtering by ``detections.tracking_id``
-        or any other Detection-level field.
+        ``F(match_field) == match_value`` (also matching the int form
+        if it parses). Useful for filtering by
+        ``detections.tracking_id`` or a custom dynamic field.
     """
 
     @property
@@ -568,13 +574,12 @@ class ViewTrackPatches(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
         inputs.str("scene_name", required=True)
+        inputs.str("scene_field", required=False)
+        inputs.list("instance_ids", types.String(), required=False)
         inputs.str("instance_id", required=False)
-        # Multi-camera surface: either a list (camera_slices) or a
-        # single name (camera_slice — legacy). When neither is set,
-        # the operator picks every non-lidar slice.
         inputs.list("camera_slices", types.String(), required=False)
         inputs.str("camera_slice", required=False)
-        # Advanced overrides
+        inputs.str("order_field", required=False)
         inputs.str("match_field", required=False)
         inputs.str("match_value", required=False)
         return types.Property(inputs)
@@ -583,6 +588,10 @@ class ViewTrackPatches(foo.Operator):
         from bson import ObjectId
 
         scene_name = ctx.params["scene_name"]
+        scene_field = ctx.params.get("scene_field") or "scene_name"
+        order_field = ctx.params.get("order_field")
+        if order_field is None:
+            order_field = "frame_idx"
         all_slices = list(ctx.dataset.group_slices or [])
 
         # ----- Resolve which slices to flatten -----
@@ -596,10 +605,6 @@ class ViewTrackPatches(foo.Operator):
         elif legacy_single:
             slices = [legacy_single]
         else:
-            # Auto-pick: every slice whose name doesn't start with
-            # "lidar". Captures all cameras across our loaders
-            # (cam_*, image_0*, front*, back_*, *_distorted, …) and
-            # skips lidar / lidar_livox / lidar_hesai.
             slices = [s for s in all_slices if not s.startswith("lidar")]
 
         missing = [s for s in slices if s not in all_slices]
@@ -616,12 +621,12 @@ class ViewTrackPatches(foo.Operator):
         # ----- Resolve the per-patch identity filter -----
         match_field = ctx.params.get("match_field")
         match_value = ctx.params.get("match_value")
-        instance_id = ctx.params.get("instance_id")
+        ids_param = ctx.params.get("instance_ids")
+        legacy_single_id = ctx.params.get("instance_id")
 
         if match_field:
             if match_value is None:
                 return {"error": "match_field set but match_value missing"}
-            # Try the literal string; also coerce to int if it parses
             try:
                 tid_int = int(match_value)
                 identity_filter = (
@@ -631,45 +636,68 @@ class ViewTrackPatches(foo.Operator):
             except (ValueError, TypeError):
                 identity_filter = F(match_field) == match_value
             identity_desc = f"{match_field}={match_value!r}"
-        elif instance_id:
-            try:
-                oid = ObjectId(instance_id)
-            except Exception as e:
-                return {
-                    "error": f"instance_id {instance_id!r} is not a valid ObjectId: {e!r}"
-                }
-            identity_filter = F("detections.instance._id") == oid
-            identity_desc = f"instance._id={instance_id}"
         else:
-            return {
-                "error": "either instance_id or (match_field + match_value) is required"
-            }
+            # Resolve the FO Instance hex list.
+            if ids_param:
+                hexes = (
+                    [h.strip() for h in ids_param.split(",") if h.strip()]
+                    if isinstance(ids_param, str)
+                    else [str(h) for h in ids_param]
+                )
+            elif legacy_single_id:
+                hexes = [str(legacy_single_id)]
+            else:
+                return {
+                    "error": "one of instance_ids / instance_id / match_field is required"
+                }
+            try:
+                oids = [ObjectId(h) for h in hexes]
+            except Exception as e:
+                return {"error": f"invalid instance hex in {hexes!r}: {e!r}"}
+            if len(oids) == 1:
+                identity_filter = F("detections.instance._id") == oids[0]
+            else:
+                identity_filter = F("detections.instance._id").is_in(oids)
+            identity_desc = (
+                f"instance._id ∈ {{{', '.join(hexes)}}}"
+                if len(hexes) > 1
+                else f"instance._id={hexes[0]}"
+            )
 
-        # to_patches('detections') promotes each Detection embedded
-        # doc to a top-level "detections" field on the patches sample
-        # — so per-Detection fields live at "detections.<name>" on
-        # the patches, not at the patch root.
+        # to_patches preserves selected sample-level fields on the
+        # patches via other_fields. We add the order_field so the
+        # final sort_by can find it (default frame_idx; user override
+        # like "timestamp_s"/"frame_number" works too). Empty
+        # order_field skips both preservation + sort.
+        other_fields = []
+        if order_field:
+            other_fields.append(order_field)
+
         view = (
             ctx.dataset.select_group_slices(slices)
-                .match(F("scene_name") == scene_name)
-                .to_patches("detections")
+                .match(F(scene_field) == scene_name)
+                .to_patches("detections", other_fields=other_fields)
                 .match(identity_filter)
-                .sort_by("sample_id")
         )
+        if order_field:
+            view = view.sort_by(order_field)
+
         n = view.count()
         if n == 0:
             return {
                 "error": (
                     f"no patches for {identity_desc} on slices "
-                    f"{slices!r} in scene {scene_name!r}"
+                    f"{slices!r} where {scene_field}={scene_name!r}"
                 )
             }
 
         ctx.ops.set_view(view=view)
         return {
+            "scene_field": scene_field,
             "scene_name": scene_name,
             "identity": identity_desc,
             "camera_slices": slices,
+            "order_field": order_field or None,
             "n_patches": int(n),
         }
 
