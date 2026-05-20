@@ -1225,24 +1225,23 @@
           ])
         : null,
 
-      // View patches button — fires the view_track_patches operator
-      // against the currently-selected track. Disabled when no track
-      // is selected.
+      // View patches button — fires view_track_patches against the
+      // currently-selected track. Filters by FO Instance hex
+      // (dataset-agnostic; the source-side tracking_id field name +
+      // type varies across loaders and external datasets). Defaults
+      // to flattening across ALL non-lidar group slices, so the
+      // resulting App grid shows patches from every camera at once.
       h("button", {
         key: "view-patches",
         onClick: function () {
-          if (selectedInstanceId == null || !payload) return;
-          var inst = (payload.instances || [])
-            .find(function (i) { return i.instance_id === selectedInstanceId; });
-          if (!inst) return;
-          var tid = inst.tracking_id;
-          if (tid == null || tid === "") return;
-          var cam = cameraMirrorSlice || "image_02";
+          if (selectedInstanceId == null || !selectedScene) return;
           try {
             viewPatchesOp.execute({
               scene_name: selectedScene,
-              tracking_id: String(tid),
-              camera_slice: cam,
+              instance_id: String(selectedInstanceId),
+              // camera_slices omitted → operator auto-picks every
+              // non-lidar slice; user can re-filter via App slice
+              // picker on the resulting patches view if needed.
             });
           } catch (e) {
             console.error("[bev-panel] view_track_patches throw", e);
@@ -1251,7 +1250,8 @@
         disabled: selectedInstanceId == null,
         title: selectedInstanceId == null
           ? "Click a track on the BEV plot or timeline first"
-          : "Switch the App view to per-patch crops of the selected track",
+          : "Switch the App view to per-patch crops of the selected "
+            + "track across all camera slices",
         style: {
           background: selectedInstanceId != null ? "#2a4a6a" : "#333",
           color: "#eee", border: "1px solid #444", borderRadius: 4,

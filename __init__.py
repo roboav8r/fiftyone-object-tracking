@@ -523,17 +523,38 @@ class GetCameraFrameUrls(foo.Operator):
 class ViewTrackPatches(foo.Operator):
     """Switch the App view to one-patch-per-frame for a single track.
 
-    Builds ``ctx.dataset.select_group_slices(<camera_slice>).match(
-    scene_name == <scene>).to_patches('detections').match(
-    detections.tracking_id == <tid>)`` and triggers ``set_view`` to
-    apply it. JS fires this when the user clicks a track on the BEV
-    scene plot (or a timeline row) and clicks the "View patches"
-    button.
+    Flattens the dataset across one or more camera slices, filters to
+    a single scene + ``fo.Instance.id`` (the FO-side cross-frame
+    identifier shared by every Detection of the same track), and
+    applies the resulting patches view via ``ctx.ops.set_view``.
 
-    The resulting view in the App is a flat patches view where each
-    sample is a cropped bbox of the chosen track from one keyframe.
-    Useful for visual identity sanity-checks: scroll the grid +
-    confirm the track is the same physical object frame-to-frame.
+    Why ``instance._id`` instead of the source-side ``tracking_id``?
+    The source-side field name is dataset-specific (``tracking_id``
+    for our loaders, but e.g. KITTI uses ``track_id``, public MOT
+    benchmarks use other names) AND can be stored as different types
+    (str vs int). The FO ``Instance`` id is dataset-agnostic and the
+    same for all of a track's Detections regardless of loader. JS
+    already has the selected track's instance hex (it's how the BEV
+    panel highlights selected tracks), so the operator stays clean.
+
+    Advanced users can override via ``match_field`` + ``match_value``
+    to filter by any other Detection-level field (e.g.
+    ``"detections.tracking_id"`` or a custom dynamic field).
+
+    Inputs:
+      scene_name: str — required.
+      instance_id: str — required FO ``fo.Instance`` hex; the
+        ``ObjectId`` form of ``detection.instance._id``. JS passes
+        this directly from the panel's ``selectedInstanceId`` state.
+      camera_slices: list[str] (or comma-separated string) —
+        optional. When omitted/empty, the operator auto-picks every
+        non-lidar group slice (i.e. all cameras). ``camera_slice``
+        (singular str) is also accepted as a single-slice shortcut.
+      match_field, match_value: optional advanced override. When set,
+        replaces the ``detections.instance._id`` match with
+        ``F(match_field) == match_value`` (or its int form if it
+        parses). Useful for filtering by ``detections.tracking_id``
+        or any other Detection-level field.
     """
 
     @property
@@ -547,46 +568,108 @@ class ViewTrackPatches(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
         inputs.str("scene_name", required=True)
-        inputs.str("tracking_id", required=True)
-        inputs.str("camera_slice", default="image_02")
+        inputs.str("instance_id", required=False)
+        # Multi-camera surface: either a list (camera_slices) or a
+        # single name (camera_slice — legacy). When neither is set,
+        # the operator picks every non-lidar slice.
+        inputs.list("camera_slices", types.String(), required=False)
+        inputs.str("camera_slice", required=False)
+        # Advanced overrides
+        inputs.str("match_field", required=False)
+        inputs.str("match_value", required=False)
         return types.Property(inputs)
 
     def execute(self, ctx) -> dict[str, Any]:
+        from bson import ObjectId
+
         scene_name = ctx.params["scene_name"]
-        tracking_id = ctx.params["tracking_id"]
-        camera_slice = ctx.params.get("camera_slice") or "image_02"
+        all_slices = list(ctx.dataset.group_slices or [])
 
-        if camera_slice not in (ctx.dataset.group_slices or []):
-            return {"error": f"slice {camera_slice!r} not in dataset slices."}
+        # ----- Resolve which slices to flatten -----
+        slices_param = ctx.params.get("camera_slices")
+        legacy_single = ctx.params.get("camera_slice")
+        if slices_param:
+            if isinstance(slices_param, str):
+                slices = [s.strip() for s in slices_param.split(",") if s.strip()]
+            else:
+                slices = list(slices_param)
+        elif legacy_single:
+            slices = [legacy_single]
+        else:
+            # Auto-pick: every slice whose name doesn't start with
+            # "lidar". Captures all cameras across our loaders
+            # (cam_*, image_0*, front*, back_*, *_distorted, …) and
+            # skips lidar / lidar_livox / lidar_hesai.
+            slices = [s for s in all_slices if not s.startswith("lidar")]
 
-        # to_patches('detections') promotes each Detection embedded doc
-        # to a top-level "detections" field on the patches sample (NOT
-        # a flat per-field promotion), so the source-stamped
-        # tracking_id lives at "detections.tracking_id" rather than at
-        # the patch root. Match accordingly.
+        missing = [s for s in slices if s not in all_slices]
+        if missing:
+            return {
+                "error": (
+                    f"slices {missing!r} not in dataset.group_slices "
+                    f"{all_slices!r}"
+                )
+            }
+        if not slices:
+            return {"error": "no camera slices to view"}
+
+        # ----- Resolve the per-patch identity filter -----
+        match_field = ctx.params.get("match_field")
+        match_value = ctx.params.get("match_value")
+        instance_id = ctx.params.get("instance_id")
+
+        if match_field:
+            if match_value is None:
+                return {"error": "match_field set but match_value missing"}
+            # Try the literal string; also coerce to int if it parses
+            try:
+                tid_int = int(match_value)
+                identity_filter = (
+                    (F(match_field) == match_value)
+                    | (F(match_field) == tid_int)
+                )
+            except (ValueError, TypeError):
+                identity_filter = F(match_field) == match_value
+            identity_desc = f"{match_field}={match_value!r}"
+        elif instance_id:
+            try:
+                oid = ObjectId(instance_id)
+            except Exception as e:
+                return {
+                    "error": f"instance_id {instance_id!r} is not a valid ObjectId: {e!r}"
+                }
+            identity_filter = F("detections.instance._id") == oid
+            identity_desc = f"instance._id={instance_id}"
+        else:
+            return {
+                "error": "either instance_id or (match_field + match_value) is required"
+            }
+
+        # to_patches('detections') promotes each Detection embedded
+        # doc to a top-level "detections" field on the patches sample
+        # — so per-Detection fields live at "detections.<name>" on
+        # the patches, not at the patch root.
         view = (
-            ctx.dataset.select_group_slices(camera_slice)
+            ctx.dataset.select_group_slices(slices)
                 .match(F("scene_name") == scene_name)
                 .to_patches("detections")
-                .match(F("detections.tracking_id") == str(tracking_id))
+                .match(identity_filter)
                 .sort_by("sample_id")
         )
         n = view.count()
         if n == 0:
             return {
                 "error": (
-                    f"no patches for tracking_id={tracking_id!r} on "
-                    f"{camera_slice!r} in scene {scene_name!r}"
+                    f"no patches for {identity_desc} on slices "
+                    f"{slices!r} in scene {scene_name!r}"
                 )
             }
 
-        # Apply the view to the App. ctx.ops.set_view is the built-in
-        # mechanism to mutate the current App view from an operator.
         ctx.ops.set_view(view=view)
         return {
             "scene_name": scene_name,
-            "tracking_id": str(tracking_id),
-            "camera_slice": camera_slice,
+            "identity": identity_desc,
+            "camera_slices": slices,
             "n_patches": int(n),
         }
 
