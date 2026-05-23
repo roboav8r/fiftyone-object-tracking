@@ -26,6 +26,7 @@ import tempfile
 from typing import Any
 
 import numpy as np
+from bson import ObjectId
 
 import fiftyone as fo
 import fiftyone.core.storage as fos
@@ -47,6 +48,8 @@ from ._thumbnail import render_trajectory_thumbnail
 
 
 DEFAULT_LIDAR_SLICE = "lidar"
+DEFAULT_SOURCE_FIELD = "detections"
+DEFAULT_TARGET_FIELD = "corrected_detections"
 
 
 # -----------------------------------------------------------------------------
@@ -66,6 +69,170 @@ def _footprint_corners(cx: float, cy: float, yaw: float,
     hL, hW = length / 2.0, width / 2.0
     local = ((+hL, +hW), (+hL, -hW), (-hL, -hW), (-hL, +hW))
     return [(cx + c * lx - s * ly, cy + s * lx + c * ly) for lx, ly in local]
+
+
+def _resolve_lidar_slice(dataset) -> str | None:
+    """First slice named exactly 'lidar', else first slice with 'lidar'
+    in its name. Mirrors the existing logic in ListTrackingScenes.
+    """
+    group_slices = list(dataset.group_slices or [])
+    if DEFAULT_LIDAR_SLICE in group_slices:
+        return DEFAULT_LIDAR_SLICE
+    return next((s for s in group_slices if "lidar" in s.lower()), None)
+
+
+def _ensure_target_field(dataset, source_field: str, target_field: str) -> bool:
+    """If target_field is missing from the schema, copy source_field into
+    it across every group slice via ``clone_sample_field``. Idempotent.
+    Raises ValueError if neither field exists. Returns True if a copy
+    actually happened.
+    """
+    if source_field == target_field:
+        return False
+    if dataset.get_field(target_field) is not None:
+        return False
+    if dataset.get_field(source_field) is None:
+        raise ValueError(
+            f"Cannot copy: source field {source_field!r} not present on "
+            f"dataset {dataset.name!r}"
+        )
+    # clone_sample_field adds the field to the schema AND deep-copies every
+    # sample's value across all group slices. set_field+save would require
+    # target_field to already exist in the schema, which is the bug this
+    # replaces.
+    dataset.clone_sample_field(source_field, target_field)
+    return True
+
+
+def _instances_from_selected_samples(dataset, sample_ids, target_field):
+    """Look up distinct instance._id hexes plus the (min frame_idx, set
+    of scene_names) carried by the given sample ids in target_field.
+    """
+    if not sample_ids:
+        return [], None, set()
+    view = dataset.select(sample_ids)
+    scenes, frames, inst_lists = view.values([
+        "scene_name", "frame_idx",
+        f"{target_field}.detections.instance._id",
+    ])
+    hexes: set[str] = set()
+    for inst_list in inst_lists or []:
+        if not inst_list:
+            continue
+        for oid in inst_list:
+            if oid is not None:
+                hexes.add(str(oid))
+    min_frame = min((int(f) for f in (frames or []) if f is not None), default=None)
+    scene_set = {s for s in (scenes or []) if s}
+    return sorted(hexes), min_frame, scene_set
+
+
+def _reassign_instances_across_slices(
+    dataset, *, target_field, scene_name,
+    match_instance_oids, replace_when_hex_in,
+    new_instance, extra_match=None, log_prefix="reassign",
+):
+    """Walk every group slice, find detections whose ``instance._id`` is
+    in ``match_instance_oids`` (and optionally satisfy ``extra_match``),
+    and replace ``det.instance`` with ``new_instance``.
+
+    Per-slice iteration (not ``_allow_mixed=True``) so
+    ``iter_samples(autosave=True)`` reliably persists writes back. Returns
+    ``(n_detections, n_samples)``.
+    """
+    n_det = 0
+    n_samp = 0
+    per_slice = {}
+    slices = list(dataset.group_slices or [])
+    if not slices:
+        slices = [None]  # non-grouped fallback (shouldn't happen in this plugin)
+
+    # Use Mongo dict form for the instance filter. F(path).is_in([oid])
+    # on a nested-array-of-subdocs path doesn't generate the elemMatch
+    # we want — it compares the whole array as a single value and matches
+    # nothing. The dict form maps directly to MongoDB's
+    # `{array_path: {$in: [...]}}` which IS elemMatch for array fields.
+    inst_filter = {
+        f"{target_field}.detections.instance._id": {"$in": list(match_instance_oids)},
+    }
+
+    for slice_name in slices:
+        view = (
+            dataset.select_group_slices(slice_name)
+            if slice_name is not None else dataset.view()
+        )
+        if scene_name:
+            view = view.match(F("scene_name") == scene_name)
+        n_scene = view.count() if scene_name else None
+        view = view.match(inst_filter)
+        n_after_inst = view.count()
+        if extra_match is not None:
+            view = view.match(extra_match)
+        n_after_extra = view.count()
+
+        slice_dets = 0
+        slice_samps = 0
+        for sample in view.iter_samples(autosave=True):
+            dets = sample[target_field]
+            if dets is None:
+                continue
+            changed = False
+            for det in dets.detections:
+                if det.instance is None:
+                    continue
+                if det.instance.id in replace_when_hex_in:
+                    det.instance = new_instance
+                    slice_dets += 1
+                    changed = True
+            if changed:
+                sample[target_field] = dets
+                slice_samps += 1
+        per_slice[slice_name or "_default"] = {
+            "n_scene": n_scene,
+            "n_after_inst_filter": n_after_inst,
+            "n_after_extra_filter": n_after_extra,
+            "n_det_changed": slice_dets,
+            "n_samp_touched": slice_samps,
+        }
+        n_det += slice_dets
+        n_samp += slice_samps
+
+    print(
+        f"[{log_prefix}] target_field={target_field!r} scene={scene_name!r} "
+        f"matched_hexes={sorted(replace_when_hex_in)!r} "
+        f"per_slice={per_slice} totals=(det={n_det}, samp={n_samp})"
+    )
+    return n_det, n_samp, per_slice
+
+
+def _instances_from_selected_labels(dataset, selected_labels, target_field):
+    """Resolve the (instance hex, min frame_idx, scene_names) tuple for
+    a list of ctx.selected_labels entries. Each entry has at least
+    ``label_id`` and ``sample_id``; ``field`` and ``frame_number`` are
+    ignored for grouped sample-level detections (we always read
+    ``target_field`` and treat all matching detections as candidates).
+    """
+    if not selected_labels:
+        return [], None, set()
+    sample_ids = sorted({sl["sample_id"] for sl in selected_labels})
+    label_ids = {sl["label_id"] for sl in selected_labels}
+
+    view = dataset.select(sample_ids)
+    scenes, frames, ids_per_sample, oids_per_sample = view.values([
+        "scene_name", "frame_idx",
+        f"{target_field}.detections.id",
+        f"{target_field}.detections.instance._id",
+    ])
+    hexes: set[str] = set()
+    for det_ids, det_oids in zip(ids_per_sample or [], oids_per_sample or []):
+        if not det_ids:
+            continue
+        for det_id, oid in zip(det_ids, det_oids or []):
+            if det_id in label_ids and oid is not None:
+                hexes.add(str(oid))
+    min_frame = min((int(f) for f in (frames or []) if f is not None), default=None)
+    scene_set = {s for s in (scenes or []) if s}
+    return sorted(hexes), min_frame, scene_set
 
 
 # -----------------------------------------------------------------------------
@@ -93,9 +260,12 @@ class ListTrackingScenes(foo.Operator):
                 "error": "No lidar group slice found on this dataset.",
             }
 
-        view = ctx.view.select_group_slices(lidar_slice) \
-            if hasattr(ctx, "view") and ctx.view is not None \
-            else ctx.dataset.select_group_slices(lidar_slice)
+        # Always go through ctx.dataset, not ctx.view. The BEV panel
+        # works on full scenes regardless of grid filtering, and ctx.view
+        # may be a PatchesView / ClipsView / etc. whose
+        # select_group_slices() raises ("<class 'PatchesView'> has no
+        # groups").
+        view = ctx.dataset.select_group_slices(lidar_slice)
 
         scene_names, frame_idxs, sample_ids = view.values(
             ["scene_name", "frame_idx", "id"]
@@ -115,9 +285,24 @@ class ListTrackingScenes(foo.Operator):
                 entry["first_frame_idx"] = fidx
                 entry["first_lidar_sample_id"] = sid
 
+        # Discover Detections-typed fields on the lidar slice so the BEV
+        # panel can populate the "View field" dropdown. Includes the
+        # canonical "detections" plus any sibling fields (e.g. user-
+        # created "detections_corrected" after a Split/Merge edit).
+        det_fields: list[str] = []
+        try:
+            schema = ctx.dataset.select_group_slices(lidar_slice).get_field_schema(
+                ftype=fo.EmbeddedDocumentField,
+                embedded_doc_type=fo.Detections,
+            )
+            det_fields = sorted(schema.keys())
+        except Exception:
+            det_fields = []
+
         return {
             "scenes": sorted(scenes.values(), key=lambda s: s["scene_name"]),
             "group_slices": {"all": group_slices, "lidar": lidar_slice},
+            "detections_fields": det_fields,
         }
 
 
@@ -138,11 +323,25 @@ class GetSceneTrackPayload(foo.Operator):
         inputs = types.Object()
         inputs.str("scene_name", required=True)
         inputs.str("lidar_slice", default=DEFAULT_LIDAR_SLICE)
+        inputs.str("source_field", default=DEFAULT_SOURCE_FIELD)
         return types.Property(inputs)
 
     def execute(self, ctx) -> dict[str, Any]:
         scene_name = ctx.params["scene_name"]
         lidar_slice = ctx.params.get("lidar_slice") or DEFAULT_LIDAR_SLICE
+        source_field = ctx.params.get("source_field") or DEFAULT_SOURCE_FIELD
+
+        if ctx.dataset.get_field(source_field) is None:
+            return {
+                "scene_name": scene_name,
+                "source_field": source_field,
+                "error": (
+                    f"Field {source_field!r} does not exist on dataset "
+                    f"{ctx.dataset.name!r}. Make an edit (Split/Merge) "
+                    f"to auto-create it from 'detections', or type a "
+                    f"different View field."
+                ),
+            }
 
         lidar_view = ctx.dataset.select_group_slices(lidar_slice).match(
             F("scene_name") == scene_name
@@ -168,12 +367,12 @@ class GetSceneTrackPayload(foo.Operator):
             "world_to_base.matrix_4x4_row_major",
             "world_to_base.translation",
             "world_to_base.quaternion_xyzw",
-            "detections.detections.instance._id",
-            "detections.detections.label",
-            "detections.detections.tracking_id",
-            "detections.detections.location",
-            "detections.detections.rotation",
-            "detections.detections.dimensions",
+            f"{source_field}.detections.instance._id",
+            f"{source_field}.detections.label",
+            f"{source_field}.detections.tracking_id",
+            f"{source_field}.detections.location",
+            f"{source_field}.detections.rotation",
+            f"{source_field}.detections.dimensions",
         ])
 
         n_frames = len(sample_ids)
@@ -277,6 +476,7 @@ class GetSceneTrackPayload(foo.Operator):
         return {
             "scene_name": scene_name,
             "lidar_slice": lidar_slice,
+            "source_field": source_field,
             "frame_indices": [int(f) for f in frame_idxs],
             "lidar_sample_ids": list(sample_ids),
             "m_frame_timestamps": list(m_ts),
@@ -703,6 +903,299 @@ class ViewTrackPatches(foo.Operator):
 
 
 # -----------------------------------------------------------------------------
+# Track correction: split / join helpers
+# -----------------------------------------------------------------------------
+
+def _resolve_track_edit_targets(ctx, target_field):
+    """Pull ``(instance_hexes, scene_name)`` from whichever invocation
+    surface fired the operator.
+
+    Priority:
+      1. ``ctx.params["instance_ids"]`` provided directly (BEV panel).
+      2. ``ctx.selected_labels`` (embeddings panel lasso).
+      3. ``ctx.selected`` (grid sample selection).
+
+    Scene name comes from ``ctx.params["scene_name"]`` if present, else
+    inferred from the selection. Returns ``"__MULTI__"`` for the scene
+    name when the selection spans multiple scenes; the caller should
+    surface that as an error.
+    """
+    instance_hexes = list(ctx.params.get("instance_ids") or [])
+    if ctx.params.get("instance_id"):  # legacy single
+        instance_hexes = instance_hexes + [ctx.params["instance_id"]]
+    scenes: set[str] = set()
+
+    if not instance_hexes:
+        if ctx.selected_labels:
+            instance_hexes, _frame, scenes = (
+                _instances_from_selected_labels(
+                    ctx.dataset, ctx.selected_labels, target_field
+                )
+            )
+        elif ctx.selected:
+            instance_hexes, _frame, scenes = (
+                _instances_from_selected_samples(
+                    ctx.dataset, ctx.selected, target_field
+                )
+            )
+
+    scene_name = ctx.params.get("scene_name")
+    if scene_name is None:
+        if len(scenes) == 1:
+            scene_name = next(iter(scenes))
+        elif len(scenes) > 1:
+            scene_name = "__MULTI__"
+    return instance_hexes, scene_name
+
+
+class SplitTrack(foo.Operator):
+    """Split one track at a frame.
+
+    Frames with ``frame_idx < split_frame`` keep the original
+    ``instance._id``; everything at or after ``split_frame`` is moved
+    to a freshly minted ``fo.Instance()``. Mutations apply across all
+    group slices (lidar + cameras) so cross-slice ids stay consistent.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="split_track",
+            label="Split track at frame",
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("scene_name", required=False)
+        inputs.str("source_field", default=DEFAULT_SOURCE_FIELD)
+        inputs.str("target_field", default=DEFAULT_TARGET_FIELD)
+        inputs.int(
+            "split_frame",
+            required=True,
+            label="Split frame",
+            description=(
+                "Frame index to split at. Detections with frame_idx < "
+                "this keep the original instance; detections at or after "
+                "get a freshly minted instance."
+            ),
+        )
+        inputs.list("instance_ids", types.String(), required=False)
+        inputs.str("instance_id", required=False)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        source_field = ctx.params.get("source_field") or DEFAULT_SOURCE_FIELD
+        target_field = ctx.params.get("target_field") or DEFAULT_TARGET_FIELD
+        _ensure_target_field(ctx.dataset, source_field, target_field)
+
+        instance_hexes, scene_name = _resolve_track_edit_targets(
+            ctx, target_field
+        )
+        split_frame = ctx.params.get("split_frame")
+
+        if scene_name == "__MULTI__":
+            return {"error": "split_track: selection spans multiple scenes"}
+        if not instance_hexes:
+            return {"error": "split_track: no instance to split"}
+        if len(instance_hexes) != 1:
+            return {
+                "error": (
+                    f"split_track expects exactly 1 instance; got "
+                    f"{len(instance_hexes)}"
+                )
+            }
+        if split_frame is None:
+            return {"error": "split_track: split_frame is required"}
+
+        instance_hex = instance_hexes[0]
+        oid = ObjectId(instance_hex)
+        split_frame = int(split_frame)
+
+        # Pre-flight: what frames does this instance actually occupy in
+        # target_field on the lidar slice? Surface that range so the user
+        # can spot "I picked a fragment / wrong instance" misclicks.
+        lidar_slice = _resolve_lidar_slice(ctx.dataset)
+        instance_frame_range = None
+        if lidar_slice is not None:
+            lidar_for_inst = ctx.dataset.select_group_slices(lidar_slice)
+            if scene_name:
+                lidar_for_inst = lidar_for_inst.match(
+                    F("scene_name") == scene_name
+                )
+            lidar_for_inst = lidar_for_inst.match({
+                f"{target_field}.detections.instance._id": oid,
+            })
+            lo, hi = lidar_for_inst.bounds("frame_idx")
+            n_lidar = lidar_for_inst.count()
+            instance_frame_range = {
+                "min": None if lo is None else int(lo),
+                "max": None if hi is None else int(hi),
+                "n_lidar_samples": int(n_lidar),
+            }
+
+        new_instance = fo.Instance()
+        n_det, n_samp, per_slice = _reassign_instances_across_slices(
+            ctx.dataset,
+            target_field=target_field,
+            scene_name=scene_name,
+            match_instance_oids=[oid],
+            replace_when_hex_in={instance_hex},
+            new_instance=new_instance,
+            extra_match=(F("frame_idx") >= split_frame),
+            log_prefix=f"split_track frame>={split_frame}",
+        )
+
+        # No-op surface: split_frame lay outside the instance's frame
+        # range, so the new instance has no detections. Return that
+        # explicitly so the panel doesn't move selection to a phantom.
+        if n_det == 0:
+            return {
+                "noop": True,
+                "reason": (
+                    f"instance {instance_hex} has no detections at "
+                    f"frame_idx >= {split_frame}"
+                ),
+                "scene_name": scene_name,
+                "source_field": source_field,
+                "target_field": target_field,
+                "split_frame": split_frame,
+                "old_instance_id": instance_hex,
+                "instance_frame_range": instance_frame_range,
+                "per_slice": per_slice,
+            }
+
+        return {
+            "scene_name": scene_name,
+            "source_field": source_field,
+            "target_field": target_field,
+            "split_frame": split_frame,
+            "old_instance_id": instance_hex,
+            "new_instance_id": new_instance.id,
+            "n_detections_reassigned": n_det,
+            "n_samples_touched": n_samp,
+            "instance_frame_range": instance_frame_range,
+            "per_slice": per_slice,
+        }
+
+
+class JoinTracks(foo.Operator):
+    """Merge N tracks onto a single ``fo.Instance``.
+
+    The winning instance is the one whose earliest detection has the
+    lowest ``frame_idx`` on the lidar slice. All other selected
+    instances are rewritten to the winner across every group slice.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="join_tracks",
+            label="Join tracks",
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("scene_name", required=False)
+        inputs.str("source_field", default=DEFAULT_SOURCE_FIELD)
+        inputs.str("target_field", default=DEFAULT_TARGET_FIELD)
+        inputs.list("instance_ids", types.String(), required=False)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        source_field = ctx.params.get("source_field") or DEFAULT_SOURCE_FIELD
+        target_field = ctx.params.get("target_field") or DEFAULT_TARGET_FIELD
+        _ensure_target_field(ctx.dataset, source_field, target_field)
+
+        instance_hexes, scene_name = _resolve_track_edit_targets(
+            ctx, target_field
+        )
+        if scene_name == "__MULTI__":
+            return {"error": "join_tracks: selection spans multiple scenes"}
+        if len(instance_hexes) < 2:
+            return {
+                "noop": True,
+                "reason": "fewer than 2 instances to join",
+                "n_instances": len(instance_hexes),
+            }
+
+        # --- Choose the winner: earliest lidar appearance
+        # Same elemMatch caveat as split: F(nested.array.field) == oid
+        # does not reliably hit array elements; use the Mongo dict form.
+        lidar_slice = _resolve_lidar_slice(ctx.dataset)
+        if lidar_slice is None:
+            return {"error": "no lidar group slice on this dataset"}
+        lidar = ctx.dataset.select_group_slices(lidar_slice)
+        if scene_name:
+            lidar = lidar.match(F("scene_name") == scene_name)
+
+        INF = float("inf")
+        per_inst_min: dict[str, float] = {}
+        for hex_ in instance_hexes:
+            sub = lidar.match({
+                f"{target_field}.detections.instance._id": ObjectId(hex_),
+            })
+            lo, _hi = sub.bounds("frame_idx")
+            per_inst_min[hex_] = INF if lo is None else float(lo)
+        if all(v == INF for v in per_inst_min.values()):
+            return {
+                "error": "no detections found for any selected instance",
+                "per_inst_min": {k: (None if v == INF else v)
+                                 for k, v in per_inst_min.items()},
+                "target_field": target_field,
+                "scene_name": scene_name,
+            }
+        winner_hex = min(per_inst_min, key=per_inst_min.get)
+        loser_hexes = [h for h in instance_hexes if h != winner_hex]
+
+        # --- Find the existing fo.Instance object for the winner
+        # (must reuse the same object across all loser detections so they
+        # share an id; minting fresh fo.Instance()s would mint fresh ids).
+        # Look up on the lidar slice via dict-form match for reliable
+        # elemMatch on the nested array path.
+        winner_oid = ObjectId(winner_hex)
+        winner_instance = None
+        for sample in (
+            lidar.match({
+                f"{target_field}.detections.instance._id": winner_oid,
+            }).limit(1)
+        ):
+            dets = sample[target_field]
+            if dets is None:
+                continue
+            for det in dets.detections:
+                if det.instance is not None and det.instance.id == winner_hex:
+                    winner_instance = det.instance
+                    break
+            if winner_instance is not None:
+                break
+        if winner_instance is None:
+            return {"error": f"could not locate winner instance {winner_hex}"}
+
+        loser_oids = [ObjectId(h) for h in loser_hexes]
+        loser_hex_set = set(loser_hexes)
+        n_det, n_samp, per_slice = _reassign_instances_across_slices(
+            ctx.dataset,
+            target_field=target_field,
+            scene_name=scene_name,
+            match_instance_oids=loser_oids,
+            replace_when_hex_in=loser_hex_set,
+            new_instance=winner_instance,
+            log_prefix=f"join_tracks winner={winner_hex}",
+        )
+
+        return {
+            "scene_name": scene_name,
+            "source_field": source_field,
+            "target_field": target_field,
+            "winner_instance_id": winner_hex,
+            "merged": loser_hexes,
+            "n_detections_reassigned": n_det,
+            "n_samples_touched": n_samp,
+            "per_slice": per_slice,
+        }
+
+
+# -----------------------------------------------------------------------------
 # Plugin registration
 # -----------------------------------------------------------------------------
 
@@ -712,3 +1205,5 @@ def register(p):
     p.register(GetCameraFrameUrls)
     p.register(ViewTrackPatches)
     p.register(BuildTrajectories)
+    p.register(SplitTrack)
+    p.register(JoinTracks)
