@@ -418,8 +418,14 @@ def _record_from_ego(
 def build_track_records(
     lidar_view, *, source_dataset: str,
     ego_size_lwh: tuple = DEFAULT_EGO_SIZE_LWH,
+    field_path: str = "detections",
 ) -> tuple[Optional[TrajectoryRecord], list[TrajectoryRecord]]:
     """Walk a sorted-by-``frame_idx`` lidar view of one scene and emit records.
+
+    ``field_path`` is the sample-level Detections field to read from
+    (default ``"detections"``). Pass ``"corrected_detections"`` (or any
+    other Detections-typed field) to build trajectories off an edited
+    copy.
 
     Returns ``(ego_record_or_None, [object_records, ...])``. Object
     records with fewer than 2 frames are dropped.
@@ -438,13 +444,13 @@ def build_track_records(
         "world_to_base.matrix_4x4_row_major",
         "world_to_base.translation",
         "world_to_base.quaternion_xyzw",
-        "detections.detections.instance._id",
-        "detections.detections.label",
-        "detections.detections.location",
-        "detections.detections.rotation",
-        "detections.detections.dimensions",
-        "detections.detections.tracking_id",
-        "detections.detections.segment_index",
+        f"{field_path}.detections.instance._id",
+        f"{field_path}.detections.label",
+        f"{field_path}.detections.location",
+        f"{field_path}.detections.rotation",
+        f"{field_path}.detections.dimensions",
+        f"{field_path}.detections.tracking_id",
+        f"{field_path}.detections.segment_index",
     ]
     (
         sample_ids, frame_idxs, m_tss,

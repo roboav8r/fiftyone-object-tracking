@@ -926,6 +926,8 @@
     var getPayloadOp = foo.useOperatorExecutor(OP("get_scene_track_payload"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
     var getCamUrlsOp = foo.useOperatorExecutor(OP("get_camera_frame_urls"));
+    var splitTrackOp = foo.useOperatorExecutor(OP("split_track"));
+    var joinTracksOp = foo.useOperatorExecutor(OP("join_tracks"));
 
     // FOE plugin SDK injects isModalPanel + dimensions on the panel props.
     // Default to grid behavior if the prop is missing.
@@ -960,6 +962,13 @@
     // panel. Plain click → set-of-one (replace); Ctrl/Cmd/Shift-click
     // → toggle the clicked track in/out of the existing set.
     var [selectedInstanceIds, setSelectedInstanceIds] = useState(new Set());
+    // What the BEV chart visualizes. Switch to a non-default field
+    // (e.g. "detections_corrected") to inspect an edited copy.
+    var [viewField, setViewField] = useState("detections");
+    // What Split/Join operators write into. Defaults to a sibling field
+    // so edits are non-destructive. Auto-created (copied from
+    // "detections") by _ensure_target_field on first edit.
+    var [editField, setEditField] = useState("detections_corrected");
     var handleSelectInstance = useCallback(function (id, additive) {
       if (id == null) { setSelectedInstanceIds(new Set()); return; }
       if (additive) {
@@ -977,10 +986,13 @@
         });
       }
     }, []);
-    // Which group slice the inline camera thumbnail mirrors. Default
-    // "image_02" for KITTI/multi-camera datasets; user can change in
-    // the header dropdown. Set to null to hide the thumbnail.
-    var [cameraMirrorSlice, setCameraMirrorSlice] = useState("image_02");
+    // Which group slice the inline camera thumbnail mirrors. Defaults
+    // to null ("(none)" in the dropdown) so we don't fire a fetch for a
+    // slice that may not exist on the active dataset (the prior
+    // "image_02" default was KITTI-specific and produced a console
+    // error on every other dataset). The user picks a slice from the
+    // dropdown, which is populated from the dataset's actual slices.
+    var [cameraMirrorSlice, setCameraMirrorSlice] = useState(null);
     // Cache: { "<scene>:<slice>": { "<frame_idx>": url } }
     var [cameraUrlsCache, _setCameraUrlsCache] = useState({});
     var cameraUrlsCacheRef = useRef(cameraUrlsCache);
@@ -1003,11 +1015,30 @@
       modalSampleId = _msid || null;
     } catch (e) { /* atom not exported on this FOE version */ }
 
-    // Grid-mode multi-selection: Set<string>.
+    // Grid-mode multi-selection. Coerce to a plain JS Set<string>
+    // regardless of FO version (we've seen the atom return Set,
+    // ImmutableSet, plain Array, or null across versions). If we leave
+    // it as whatever FO gave us and FO later calls .get/.has on the
+    // value we wrote back, mismatched types surface as "e.get is not a
+    // function" in the grid. Coercion at the boundary keeps our writes
+    // back to FO well-typed.
     var selectedSamples = new Set();
     try {
-      selectedSamples =
-        recoil.useRecoilValue(fos.selectedSamples) || new Set();
+      var _ss = recoil.useRecoilValue(fos.selectedSamples);
+      if (_ss == null) {
+        selectedSamples = new Set();
+      } else if (_ss instanceof Set) {
+        selectedSamples = _ss;
+      } else if (Array.isArray(_ss)) {
+        selectedSamples = new Set(_ss);
+      } else if (typeof _ss.values === "function") {
+        // Immutable.Set / Map etc. — harvest iterable values.
+        try { selectedSamples = new Set(Array.from(_ss.values())); }
+        catch (_e) { selectedSamples = new Set(); }
+      } else {
+        console.warn("[bev-panel] unexpected selectedSamples shape:", _ss);
+        selectedSamples = new Set();
+      }
     } catch (e) { /* atom not exported on this FOE version */ }
 
     // ---- Recoil write sinks ----
@@ -1056,20 +1087,24 @@
       }
     }, [listScenesOp.result]);
 
-    // Fire get_scene_track_payload when scene changes (deduped).
+    // Fire get_scene_track_payload when (scene, viewField) changes (deduped).
+    // Cache key includes viewField so flipping fields re-fetches.
     var lastPayloadKeyRef = useRef(null);
     useEffect(function () {
       if (!selectedScene) return;
-      var key = selectedScene;
+      var key = selectedScene + "::" + (viewField || "detections");
       if (payloadCacheRef.current[key]) return;
       if (lastPayloadKeyRef.current === key) return;
       lastPayloadKeyRef.current = key;
       try {
-        getPayloadOp.execute({ scene_name: selectedScene });
+        getPayloadOp.execute({
+          scene_name: selectedScene,
+          source_field: viewField || "detections",
+        });
       } catch (e) {
         console.error("[bev-panel] get_scene_track_payload throw", e);
       }
-    }, [selectedScene]);
+    }, [selectedScene, viewField]);
 
     // Fire get_camera_frame_urls when (scene, slice) changes and
     // the cache doesn't already have that key. Deduped via a ref.
@@ -1121,7 +1156,7 @@
         return;
       }
       if (!out || !out.scene_name) return;
-      var key = out.scene_name;
+      var key = out.scene_name + "::" + (out.source_field || "detections");
       setPayloadCache(function (prev) {
         var next = Object.assign({}, prev); next[key] = out; return next;
       });
@@ -1130,7 +1165,103 @@
       }
     }, [getPayloadOp.result]);
 
-    var payload = payloadCache[selectedScene || ""] || null;
+    // Consume split_track / join_tracks results: bust the cached payload
+    // for (scene, target_field), flip viewField to the edited field so
+    // the chart re-renders against the just-written detections, and
+    // re-select the resulting instance (new for split, winner for join).
+    var lastConsumedSplitRef = useRef(null);
+    useEffect(function () {
+      var result = splitTrackOp.result;
+      if (!result || result === lastConsumedSplitRef.current) return;
+      lastConsumedSplitRef.current = result;
+      var out = result.result || result;
+      if (out && out.error) {
+        console.error("[bev-panel] split_track error:", out.error);
+        return;
+      }
+      console.log("[bev-panel] split_track result:", out);
+      if (out && out.noop) {
+        // No detections were at frame_idx >= split_frame for this
+        // instance. Don't touch cache or selection — the chart already
+        // shows the (unchanged) reality. Just surface a loud warning
+        // with the instance's actual frame range so the user can see
+        // they picked a fragment or the wrong split frame.
+        var range = out.instance_frame_range || {};
+        console.warn(
+          "[bev-panel] split_track no-op: " + (out.reason || "") +
+          " (instance frames in target field: " +
+          (range.min == null ? "?" : range.min) + ".." +
+          (range.max == null ? "?" : range.max) +
+          ", " + (range.n_lidar_samples || 0) + " lidar samples)"
+        );
+        return;
+      }
+      var field = out.target_field || editField || "detections_corrected";
+      var scene = out.scene_name || selectedScene;
+      var key = scene + "::" + field;
+      setPayloadCache(function (prev) {
+        var next = Object.assign({}, prev); delete next[key]; return next;
+      });
+      lastPayloadKeyRef.current = null;
+      if (field !== viewField) setViewField(field);
+      if (out.new_instance_id) {
+        setSelectedInstanceIds(new Set([out.new_instance_id]));
+      }
+      // Explicitly refire the payload fetch. The [selectedScene,
+      // viewField] effect wouldn't re-run when the user was already
+      // viewing the same field they edited into, leaving the panel on
+      // an empty cache and stuck on the "loading scene" state.
+      try {
+        getPayloadOp.execute({ scene_name: scene, source_field: field });
+      } catch (e) {
+        console.error("[bev-panel] refresh payload after split throw", e);
+      }
+      // Refresh the View-field dropdown so a freshly-created target
+      // field appears in the options list.
+      try { listScenesOp.execute({}); } catch (e) { /* benign */ }
+    }, [splitTrackOp.result]);
+
+    var lastConsumedJoinRef = useRef(null);
+    useEffect(function () {
+      var result = joinTracksOp.result;
+      if (!result || result === lastConsumedJoinRef.current) return;
+      lastConsumedJoinRef.current = result;
+      var out = result.result || result;
+      if (out && out.error) {
+        console.error("[bev-panel] join_tracks error:", out.error);
+        return;
+      }
+      if (out && out.noop) {
+        console.warn("[bev-panel] join_tracks noop:", out.reason);
+        return;
+      }
+      console.log("[bev-panel] join_tracks result:", out);
+      var field = out.target_field || editField || "detections_corrected";
+      var scene = out.scene_name || selectedScene;
+      var key = scene + "::" + field;
+      setPayloadCache(function (prev) {
+        var next = Object.assign({}, prev); delete next[key]; return next;
+      });
+      lastPayloadKeyRef.current = null;
+      if (field !== viewField) setViewField(field);
+      if (out.winner_instance_id) {
+        setSelectedInstanceIds(new Set([out.winner_instance_id]));
+      }
+      // Explicitly refire the payload fetch (see split consume effect
+      // for the same fix and rationale).
+      try {
+        getPayloadOp.execute({ scene_name: scene, source_field: field });
+      } catch (e) {
+        console.error("[bev-panel] refresh payload after join throw", e);
+      }
+      // Refresh the View-field dropdown so a freshly-created target
+      // field appears in the options list.
+      try { listScenesOp.execute({}); } catch (e) { /* benign */ }
+    }, [joinTracksOp.result]);
+
+    var payload = payloadCache[
+      (selectedScene || "") + "::" + (viewField || "detections")
+    ] || null;
 
     // ---- Sync App → panel scrub position ----
     // Modal: drive the scrubber from the open modal sample.
@@ -1174,9 +1305,12 @@
       // Grid mode: highlight the lidar sample at this frame so the user
       // can double-click into the modal manually. Modal mode: no-op
       // (FO 2.18 modal atom too fragile to write from a plugin; see the
-      // "setModalSample = null" comment block above).
+      // "setModalSample = null" comment block above). Wrap in try/catch
+      // so a Recoil type mismatch surfaces as a console warning instead
+      // of breaking the panel.
       if (!isModal && setSelectedSamples) {
-        setSelectedSamples(new Set([sid]));
+        try { setSelectedSamples(new Set([sid])); }
+        catch (e) { console.warn("[bev-panel] setSelectedSamples failed:", e); }
       }
     }, [payload, isModal, setSelectedSamples]);
 
@@ -1189,12 +1323,22 @@
     // ---- Header ----
     var sceneOptions = (sceneInfo && sceneInfo.scenes) || [];
 
-    var header = h("div", {
-      style: { display: "flex", gap: 12, padding: "8px 12px",
-               alignItems: "center", borderBottom: "1px solid #2c2c2c",
-               background: "#171717", color: "#ddd",
-               fontFamily: "ui-sans-serif, system-ui", fontSize: 12 },
-    }, [
+    // Shared flex-bar style for the top inspection row + the bottom
+    // edit-controls bar. Same look, different responsibilities.
+    var BAR_STYLE = {
+      display: "flex", gap: 12, padding: "8px 12px",
+      alignItems: "center", borderBottom: "1px solid #2c2c2c",
+      background: "#171717", color: "#ddd",
+      fontFamily: "ui-sans-serif, system-ui", fontSize: 12,
+    };
+    var INPUT_STYLE = {
+      background: "#222", color: "#eee",
+      border: "1px solid #444", padding: "2px 6px",
+      marginLeft: 4, fontFamily: "ui-monospace, monospace", fontSize: 11,
+    };
+
+    // ---- Top row: inspect (scene / view field / coord / counts / camera) ----
+    var header = h("div", { style: BAR_STYLE }, [
       h("strong", { key: "ttl" }, "BEV Track Visualization"),
 
       sceneOptions.length > 1
@@ -1213,8 +1357,37 @@
         : h("span", { key: "scene-only" },
             selectedScene ? "  Scene: " + selectedScene : ""),
 
+      // View-field dropdown — drives the BEV chart's source field.
+      // Options come from list_tracking_scenes (Detections-typed fields
+      // on the lidar slice). If the current viewField isn't in the list
+      // yet (e.g. just-edited target_field before list refresh), it's
+      // injected so the select still shows it.
+      (function () {
+        var avail = (sceneInfo && sceneInfo.detections_fields) || [];
+        var opts = avail.slice();
+        if (viewField && opts.indexOf(viewField) < 0) opts.unshift(viewField);
+        if (!opts.length) opts = ["detections"];
+        return h("label", { key: "view-field" }, [
+          "  View field: ",
+          h("select", {
+            key: "view-field-sel",
+            value: viewField,
+            onChange: function (e) { setViewField(e.target.value); },
+            style: { background: "#222", color: "#eee",
+                     border: "1px solid #444", padding: "2px 6px",
+                     marginLeft: 4, fontFamily: "ui-monospace, monospace",
+                     fontSize: 11 },
+            title: "Detections field the BEV chart visualizes. Pick "
+              + "'detections' for the source, or a sibling field (e.g. "
+              + "'detections_corrected') to see edits.",
+          }, opts.map(function (f) {
+            return h("option", { key: f, value: f }, f);
+          })),
+        ]);
+      })(),
+
       h("label", { key: "view-tog" }, [
-        "View: ",
+        "  Coord: ",
         h("select", {
           key: "view-sel",
           value: viewMode,
@@ -1226,18 +1399,17 @@
         ]),
       ]),
 
-      // Class legend grows in the middle (flex: 1 to absorb space).
+      // Class legend (track counts) grows in the middle.
       h("div", {
         key: "legend-wrap",
         style: { flex: 1, display: "flex", justifyContent: "center" },
       }, h(ClassLegend, { payload: payload })),
 
-      // Camera-mirror dropdown: picks which group slice the inline
-      // thumbnail mirrors. Hidden until the scene payload has loaded so
-      // we can populate the option list from the actual group slices.
+      // Camera-mirror dropdown — preview which group slice the inline
+      // thumbnail mirrors.
       sceneInfo && sceneInfo.group_slices && sceneInfo.group_slices.all
         ? h("label", { key: "cam-pick" }, [
-            "  Camera: ",
+            "  Preview camera: ",
             h("select", {
               key: "cam-sel",
               value: cameraMirrorSlice || "",
@@ -1252,47 +1424,6 @@
             )),
           ])
         : null,
-
-      // View patches button — fires view_track_patches against every
-      // currently-selected track. Filters by FO Instance hex
-      // (dataset-agnostic). Defaults to flattening across ALL
-      // non-lidar group slices and ordering by frame_idx so the
-      // resulting App grid shows temporally-ordered patches across
-      // every camera. Ctrl/Cmd-click a track to add it to the
-      // selection; the button caption shows the count.
-      h("button", {
-        key: "view-patches",
-        onClick: function () {
-          if (!selectedInstanceIds || selectedInstanceIds.size === 0
-              || !selectedScene) return;
-          try {
-            viewPatchesOp.execute({
-              scene_name: selectedScene,
-              instance_ids: Array.from(selectedInstanceIds),
-            });
-          } catch (e) {
-            console.error("[bev-panel] view_track_patches throw", e);
-          }
-        },
-        disabled: !selectedInstanceIds || selectedInstanceIds.size === 0,
-        title: (!selectedInstanceIds || selectedInstanceIds.size === 0)
-          ? "Click a track on the BEV plot or timeline first "
-            + "(Ctrl/Cmd-click to add more)"
-          : "Switch the App view to per-patch crops of the "
-            + (selectedInstanceIds.size === 1
-                 ? "selected track"
-                 : "selected " + selectedInstanceIds.size + " tracks")
-            + " across all camera slices, ordered by frame_idx",
-        style: {
-          background: (selectedInstanceIds && selectedInstanceIds.size > 0)
-            ? "#2a4a6a" : "#333",
-          color: "#eee", border: "1px solid #444", borderRadius: 4,
-          padding: "4px 8px",
-          cursor: (selectedInstanceIds && selectedInstanceIds.size > 0)
-            ? "pointer" : "not-allowed",
-          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
-        },
-      }, "View patches"),
     ]);
 
     // ---- Body ----
@@ -1360,6 +1491,130 @@
         : null,
     ]);
 
+    // ---- Edit-controls row: sits between the chart and the scrubber ----
+    // View patches / Edit field / Split / Join. Same look as the header
+    // so the panel reads as two stacked toolbars sandwiching the chart.
+    var canSplit = (selectedInstanceIds && selectedInstanceIds.size === 1
+                    && scrubFrameIdx != null);
+    var canJoin  = (selectedInstanceIds && selectedInstanceIds.size >= 2);
+    var canPatches = (selectedInstanceIds && selectedInstanceIds.size > 0);
+    var editBar = h("div", {
+      style: Object.assign({}, BAR_STYLE, { borderTop: "1px solid #2c2c2c",
+                                            borderBottom: "1px solid #2c2c2c" }),
+    }, [
+      h("button", {
+        key: "view-patches",
+        onClick: function () {
+          if (!canPatches || !selectedScene) return;
+          try {
+            viewPatchesOp.execute({
+              scene_name: selectedScene,
+              instance_ids: Array.from(selectedInstanceIds),
+            });
+          } catch (e) {
+            console.error("[bev-panel] view_track_patches throw", e);
+          }
+        },
+        disabled: !canPatches,
+        title: !canPatches
+          ? "Click a track on the BEV plot or timeline first "
+            + "(Ctrl/Cmd-click to add more)"
+          : "Switch the App view to per-patch crops of the "
+            + (selectedInstanceIds.size === 1
+                 ? "selected track"
+                 : "selected " + selectedInstanceIds.size + " tracks")
+            + " across all camera slices, ordered by frame_idx",
+        style: {
+          background: canPatches ? "#2a4a6a" : "#333",
+          color: "#eee", border: "1px solid #444", borderRadius: 4,
+          padding: "4px 8px",
+          cursor: canPatches ? "pointer" : "not-allowed",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
+        },
+      }, "View patches"),
+
+      // Spacer pushes the edit-field input + Split/Join to the right.
+      h("div", { key: "edit-spacer", style: { flex: 1 } }),
+
+      h("label", { key: "edit-field" }, [
+        "Edit field: ",
+        h("input", {
+          key: "edit-field-in",
+          type: "text",
+          value: editField,
+          onChange: function (e) { setEditField(e.target.value); },
+          size: 22,
+          spellCheck: false,
+          style: INPUT_STYLE,
+          title: "Detections field Split/Join write into. Auto-created "
+            + "(copied from 'detections') on first edit. Default "
+            + "'detections_corrected' keeps the source field intact.",
+        }),
+      ]),
+
+      h("button", {
+        key: "split-track",
+        onClick: function () {
+          if (!canSplit || !selectedScene) return;
+          try {
+            splitTrackOp.execute({
+              scene_name: selectedScene,
+              source_field: "detections",
+              target_field: editField || "detections_corrected",
+              split_frame: scrubFrameIdx,
+              instance_ids: Array.from(selectedInstanceIds),
+            });
+          } catch (e) {
+            console.error("[bev-panel] split_track throw", e);
+          }
+        },
+        disabled: !canSplit,
+        title: !selectedInstanceIds || selectedInstanceIds.size !== 1
+          ? "Select exactly one track first"
+          : (scrubFrameIdx == null
+              ? "Scrub to the split frame first"
+              : "Split this track at frame " + scrubFrameIdx
+                + "; writes into '" + editField + "'"),
+        style: {
+          background: canSplit ? "#5a3a2a" : "#333",
+          color: "#eee", border: "1px solid #444", borderRadius: 4,
+          padding: "4px 8px",
+          cursor: canSplit ? "pointer" : "not-allowed",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
+        },
+      }, "Split track @ frame"),
+
+      h("button", {
+        key: "join-tracks",
+        onClick: function () {
+          if (!canJoin || !selectedScene) return;
+          try {
+            joinTracksOp.execute({
+              scene_name: selectedScene,
+              source_field: "detections",
+              target_field: editField || "detections_corrected",
+              instance_ids: Array.from(selectedInstanceIds),
+            });
+          } catch (e) {
+            console.error("[bev-panel] join_tracks throw", e);
+          }
+        },
+        disabled: !canJoin,
+        title: !canJoin
+          ? "Ctrl/Cmd-click to select 2 or more tracks first"
+          : "Merge the " + selectedInstanceIds.size
+            + " selected tracks onto the earliest-frame instance; "
+            + "writes into '" + editField + "'",
+        style: {
+          background: canJoin ? "#2a5a3a" : "#333",
+          color: "#eee", border: "1px solid #444", borderRadius: 4,
+          padding: "4px 8px",
+          cursor: canJoin ? "pointer" : "not-allowed",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
+        },
+      }, "Merge tracks"),
+    ]);
+
     var scrubberBlock = h("div", {
       style: { padding: "0 12px 6px" },
     }, h(Scrubber, {
@@ -1387,7 +1642,7 @@
       style: {
         background: "#1c1c1c", color: "#eee", height: "100%", overflow: "auto",
       },
-    }, [header, bevBlock, scrubberBlock, timelineBlock]);
+    }, [header, bevBlock, editBar, scrubberBlock, timelineBlock]);
   }
 
 

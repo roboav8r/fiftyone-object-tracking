@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once it leaves `0.x`.
 
+## [Unreleased]
+
+### Added
+
+- **`split_track` operator** (listed) — splits one selected track at the
+  scrubber's current frame: detections with `frame_idx < split_frame`
+  keep the original `instance._id`; detections at or after the split
+  frame are reassigned to a freshly minted `fo.Instance()`. The mutation
+  walks every group slice (lidar + cameras) via
+  `select_group_slices(_allow_mixed=True)` so the new instance id is
+  consistent across slices.
+- **`join_tracks` operator** (listed) — merges 2+ selected tracks onto
+  a single `fo.Instance` (the one whose earliest detection has the
+  lowest `frame_idx` wins). Cross-slice, same mutation pattern as split.
+- **BEV panel: detections-field selector** — header `Field:` input
+  controls both the field the panel *visualizes* and the field
+  Split/Join write into. Defaults to `"detections"`; switch to any
+  custom name (e.g. `"corrected_detections"`) for non-destructive edits.
+  Split/Join copy `detections` into the target field on first edit if
+  the target doesn't yet exist.
+- **BEV panel: Split / Join buttons** — Split is enabled when exactly
+  one track is selected and the scrubber has a position; Join is enabled
+  when ≥2 tracks are selected. Post-edit the panel refetches the payload
+  for the active field and re-selects the resulting instance.
+- **Multi-surface operator invocation** — both operators also work
+  from the operator palette, against `ctx.selected_samples` (grid
+  selection), or against `ctx.selected_labels` (embeddings-panel lasso).
+  When no `split_frame` is provided, the operator derives it from
+  `min(frame_idx)` across the selected samples / labels.
+
+### Changed
+
+- **BEV panel header reorganized into two rows** sandwiching the chart:
+  a top *inspection* row (scene / view field / coord / counts / preview
+  camera) and a new edit-controls row beneath the chart (View patches /
+  Edit field / Split / Merge). The single-field model from the prior
+  iteration is replaced by independent `viewField` (chart) and
+  `editField` (Split/Join target); after a successful edit, the chart
+  auto-flips to the edited field so the result is visible. Coordinate
+  toggle relabelled "View:" → "Coord:". Default edit-field name is
+  `detections_corrected`.
+- **`split_track`** now declares `split_frame` as `required=True`. The
+  BEV panel button still passes it explicitly from the scrubber (so its
+  UX is unchanged), but invocations from the operator palette, grid
+  sample selection, or embeddings-panel lasso now surface an input form
+  asking for the split frame rather than silently inferring it from the
+  selection. `_resolve_track_edit_targets` no longer returns a derived
+  frame.
+- **`get_scene_track_payload`** now takes an optional `source_field`
+  param (default `"detections"`) and reads detections from that field,
+  echoing it back as `source_field` in the result so the panel can key
+  its cache by `(scene, field)`.
+- **`build_track_records`** (`_records.py`) takes a kw-only `field_path`
+  (default `"detections"`) — the six hardcoded `detections.detections.*`
+  paths now derive from this prefix.
+
 ## [0.2.0] — 2026-05-19
 
 Initial public release. Renames the plugin to its shipping namespace
