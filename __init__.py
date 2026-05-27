@@ -49,7 +49,7 @@ from ._thumbnail import render_trajectory_thumbnail
 
 DEFAULT_LIDAR_SLICE = "lidar"
 DEFAULT_SOURCE_FIELD = "detections"
-DEFAULT_TARGET_FIELD = "corrected_detections"
+DEFAULT_TARGET_FIELD = "detections_corrected"
 
 
 # -----------------------------------------------------------------------------
@@ -203,6 +203,43 @@ def _reassign_instances_across_slices(
         f"per_slice={per_slice} totals=(det={n_det}, samp={n_samp})"
     )
     return n_det, n_samp, per_slice
+
+
+def _instances_from_patches_view(ctx):
+    """If ``ctx.view`` is a ``PatchesView`` and patches are selected,
+    look them up *through the view* (sample ids in a patches view are
+    patch ids, not parent-sample ids — ``dataset.select(patch_ids)``
+    silently returns nothing).
+
+    Returns ``(hexes, min_frame, scenes, patches_field)`` or
+    ``(None, None, None, None)`` if not a patches view / no selection.
+    """
+    view = getattr(ctx, "view", None)
+    if view is None:
+        return None, None, None, None
+    # PatchesView (and EvaluationPatchesView) carry the source field
+    # name on ``_patches_field``. Generic Views won't have this.
+    patches_field = getattr(view, "_patches_field", None)
+    if patches_field is None:
+        return None, None, None, None
+    selected = list(ctx.selected or [])
+    if not selected:
+        return None, None, None, None
+    try:
+        sub = view.select(selected)
+        # In a patches view, the source list field is flattened: each
+        # row is a single Detection, accessed directly as
+        # ``{patches_field}`` (not ``{patches_field}.detections``).
+        oids = sub.values(f"{patches_field}.instance._id")
+        scene_vals = sub.values("scene_name")
+        frame_vals = sub.values("frame_idx")
+    except Exception:
+        return None, None, None, None
+    hexes = sorted({str(o) for o in (oids or []) if o})
+    scenes = {s for s in (scene_vals or []) if s}
+    frames = [int(f) for f in (frame_vals or []) if f is not None]
+    min_frame = min(frames) if frames else None
+    return hexes, min_frame, scenes, patches_field
 
 
 def _instances_from_selected_labels(dataset, selected_labels, target_field):
@@ -926,7 +963,15 @@ def _resolve_track_edit_targets(ctx, target_field):
     scenes: set[str] = set()
 
     if not instance_hexes:
-        if ctx.selected_labels:
+        # PatchesView first: ctx.selected holds patch ids that don't
+        # resolve via dataset.select(...).
+        patches_hexes, _pmin, patches_scenes, _pfield = (
+            _instances_from_patches_view(ctx)
+        )
+        if patches_hexes:
+            instance_hexes = patches_hexes
+            scenes = patches_scenes or set()
+        elif ctx.selected_labels:
             instance_hexes, _frame, scenes = (
                 _instances_from_selected_labels(
                     ctx.dataset, ctx.selected_labels, target_field
@@ -948,6 +993,117 @@ def _resolve_track_edit_targets(ctx, target_field):
     return instance_hexes, scene_name
 
 
+def _resolve_form_defaults(ctx):
+    """Inspect ``ctx`` once and return form-prefill hints for the
+    Split/Merge operator inputs.
+
+    Returns a dict with keys:
+      - ``detection_fields``: sorted list of Detections-typed field names
+        on the lidar slice. Empty if discovery fails.
+      - ``inferred_scene``: str or None (when all selected samples/labels
+        share a single scene_name).
+      - ``inferred_instance_ids``: list[str] hexes derived from the
+        selection (via the field the selection came from).
+      - ``selection_summary``: short string describing what's selected
+        (used in field descriptions to surface context to the user).
+      - ``selection_frame_range``: ``(min, max)`` tuple of ``frame_idx``
+        across selected samples, or None.
+      - ``selection_field``: the Detections field the selection came
+        from (used as the source_field default).
+    """
+    # Detections fields on the lidar slice
+    detection_fields: list[str] = []
+    try:
+        lidar_slice = _resolve_lidar_slice(ctx.dataset)
+        if lidar_slice:
+            schema = ctx.dataset.select_group_slices(
+                lidar_slice
+            ).get_field_schema(
+                ftype=fo.EmbeddedDocumentField,
+                embedded_doc_type=fo.Detections,
+            )
+            detection_fields = sorted(schema.keys())
+    except Exception:
+        detection_fields = []
+
+    inferred_scene = None
+    inferred_instance_ids: list[str] = []
+    selection_summary = ""
+    selection_frame_range: tuple | None = None
+    selection_field = None
+
+    selected_labels = list(ctx.selected_labels or [])
+    selected_samples = list(ctx.selected or [])
+
+    # Patches view takes priority — selection IDs there are patch ids,
+    # not dataset sample ids, so they must be looked up via the view.
+    patches_hexes, patches_min, patches_scenes, patches_field = (
+        _instances_from_patches_view(ctx)
+    )
+
+    if patches_hexes is not None:
+        selection_field = patches_field
+        inferred_instance_ids = patches_hexes
+        if patches_scenes and len(patches_scenes) == 1:
+            inferred_scene = next(iter(patches_scenes))
+        selection_summary = (
+            f"{len(selected_samples)} patch(es) selected "
+            f"(from PatchesView of field {patches_field!r})"
+        )
+        if patches_min is not None:
+            try:
+                view = ctx.view
+                hi = view.select(selected_samples).bounds("frame_idx")[1]
+                selection_frame_range = (
+                    patches_min, int(hi) if hi is not None else patches_min
+                )
+            except Exception:
+                selection_frame_range = (patches_min, patches_min)
+    elif selected_labels:
+        selection_field = selected_labels[0].get("field") or DEFAULT_SOURCE_FIELD
+        instances, _frame, scenes = _instances_from_selected_labels(
+            ctx.dataset, selected_labels, selection_field
+        )
+        inferred_instance_ids = instances
+        if len(scenes) == 1:
+            inferred_scene = next(iter(scenes))
+        selection_summary = (
+            f"{len(selected_labels)} label(s) selected "
+            f"(from field {selection_field!r})"
+        )
+        sample_ids = sorted({sl["sample_id"] for sl in selected_labels})
+        try:
+            lo, hi = ctx.dataset.select(sample_ids).bounds("frame_idx")
+            if lo is not None:
+                selection_frame_range = (int(lo), int(hi))
+        except Exception:
+            pass
+    elif selected_samples:
+        selection_field = DEFAULT_SOURCE_FIELD
+        instances, _frame, scenes = _instances_from_selected_samples(
+            ctx.dataset, selected_samples, selection_field
+        )
+        inferred_instance_ids = instances
+        if len(scenes) == 1:
+            inferred_scene = next(iter(scenes))
+        selection_summary = f"{len(selected_samples)} sample(s) selected"
+        try:
+            lo, hi = ctx.dataset.select(selected_samples).bounds("frame_idx")
+            if lo is not None:
+                selection_frame_range = (int(lo), int(hi))
+        except Exception:
+            pass
+
+    return {
+        "detection_fields": detection_fields,
+        "inferred_scene": inferred_scene,
+        "inferred_instance_ids": inferred_instance_ids,
+        "selection_summary": selection_summary,
+        "selection_frame_range": selection_frame_range,
+        "selection_field": selection_field,
+    }
+
+
 class SplitTrack(foo.Operator):
     """Split one track at a frame.
 
@@ -965,22 +1121,86 @@ class SplitTrack(foo.Operator):
         )
 
     def resolve_input(self, ctx):
+        d = _resolve_form_defaults(ctx)
+        sel = d["selection_summary"] or "(nothing selected)"
+        frame_range = d["selection_frame_range"]
+        frame_hint = (
+            f" Selection spans frame_idx {frame_range[0]}..{frame_range[1]}."
+            if frame_range else ""
+        )
+
         inputs = types.Object()
-        inputs.str("scene_name", required=False)
-        inputs.str("source_field", default=DEFAULT_SOURCE_FIELD)
-        inputs.str("target_field", default=DEFAULT_TARGET_FIELD)
+
+        inputs.str(
+            "scene_name",
+            label="Scene name",
+            description=(
+                "Scene to apply the split to. Auto-derived from the "
+                f"selection when possible. Current: {sel}."
+            ),
+            default=d["inferred_scene"],
+            required=False,
+        )
+
+        src_default = (
+            d["selection_field"]
+            or (DEFAULT_SOURCE_FIELD
+                if DEFAULT_SOURCE_FIELD in d["detection_fields"]
+                else (d["detection_fields"][0] if d["detection_fields"]
+                      else DEFAULT_SOURCE_FIELD))
+        )
+        src_desc = (
+            "Detections field containing the track to split. The "
+            "instance hex you pick below must exist in this field."
+        )
+        if d["detection_fields"]:
+            src_desc += " Detections fields on this dataset: " + ", ".join(
+                d["detection_fields"]
+            ) + "."
+        inputs.str(
+            "source_field",
+            label="Source field",
+            description=src_desc,
+            default=src_default,
+            required=True,
+        )
+
+        inputs.str(
+            "target_field",
+            label="Target field",
+            description=(
+                "Field to write the split into. Cloned from the source "
+                f"field on first edit if it doesn't exist. Default "
+                f"{DEFAULT_TARGET_FIELD!r} keeps the source intact."
+            ),
+            default=DEFAULT_TARGET_FIELD,
+            required=True,
+        )
+
+        inputs.list(
+            "instance_ids",
+            types.String(),
+            label="Instance IDs",
+            description=(
+                "FO ``instance._id`` hex(es) to split. Auto-derived from "
+                "the selection; split_track expects exactly one. Hexes "
+                f"derived from current selection: {d['inferred_instance_ids']!r}."
+            ),
+            default=d["inferred_instance_ids"] or None,
+            required=False,
+        )
+
         inputs.int(
             "split_frame",
-            required=True,
             label="Split frame",
             description=(
                 "Frame index to split at. Detections with frame_idx < "
                 "this keep the original instance; detections at or after "
-                "get a freshly minted instance."
+                "get a freshly minted instance." + frame_hint
             ),
+            required=True,
         )
-        inputs.list("instance_ids", types.String(), required=False)
-        inputs.str("instance_id", required=False)
+
         return types.Property(inputs)
 
     def execute(self, ctx) -> dict[str, Any]:
@@ -1094,11 +1314,72 @@ class JoinTracks(foo.Operator):
         )
 
     def resolve_input(self, ctx):
+        d = _resolve_form_defaults(ctx)
+        sel = d["selection_summary"] or "(nothing selected)"
+
         inputs = types.Object()
-        inputs.str("scene_name", required=False)
-        inputs.str("source_field", default=DEFAULT_SOURCE_FIELD)
-        inputs.str("target_field", default=DEFAULT_TARGET_FIELD)
-        inputs.list("instance_ids", types.String(), required=False)
+
+        inputs.str(
+            "scene_name",
+            label="Scene name",
+            description=(
+                "Scene to apply the merge to. Auto-derived from the "
+                f"selection when possible. Current: {sel}."
+            ),
+            default=d["inferred_scene"],
+            required=False,
+        )
+
+        src_default = (
+            d["selection_field"]
+            or (DEFAULT_SOURCE_FIELD
+                if DEFAULT_SOURCE_FIELD in d["detection_fields"]
+                else (d["detection_fields"][0] if d["detection_fields"]
+                      else DEFAULT_SOURCE_FIELD))
+        )
+        src_desc = (
+            "Detections field containing the tracks to merge. The "
+            "instance hexes you pick below must exist in this field."
+        )
+        if d["detection_fields"]:
+            src_desc += " Detections fields on this dataset: " + ", ".join(
+                d["detection_fields"]
+            ) + "."
+        inputs.str(
+            "source_field",
+            label="Source field",
+            description=src_desc,
+            default=src_default,
+            required=True,
+        )
+
+        inputs.str(
+            "target_field",
+            label="Target field",
+            description=(
+                "Field to write the merge into. Cloned from the source "
+                f"field on first edit if it doesn't exist. Default "
+                f"{DEFAULT_TARGET_FIELD!r} keeps the source intact."
+            ),
+            default=DEFAULT_TARGET_FIELD,
+            required=True,
+        )
+
+        inputs.list(
+            "instance_ids",
+            types.String(),
+            label="Instance IDs",
+            description=(
+                "FO ``instance._id`` hexes to merge. Auto-derived from "
+                "the selection; merge expects 2 or more. The instance "
+                "with the earliest frame_idx wins; all others are "
+                "rewritten onto it. Hexes derived from current "
+                f"selection: {d['inferred_instance_ids']!r}."
+            ),
+            default=d["inferred_instance_ids"] or None,
+            required=False,
+        )
+
         return types.Property(inputs)
 
     def execute(self, ctx) -> dict[str, Any]:
