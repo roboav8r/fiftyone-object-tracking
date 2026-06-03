@@ -938,6 +938,57 @@
 
 
   // ---------------------------------------------------------------------------
+  // Trajectories tab (stub) — Stage 1
+  //
+  // Will host the ephemeral-tracklet workflow: Build trajectories (extract
+  // from the tracking dataset into an ExecutionStore), Filter trajectories
+  // (select tracks meeting one or more conditions), a saved-filters picker,
+  // and an in-panel SVG grid of the resulting tracklets. For now it is an
+  // inert placeholder so the tab shell can be wired and verified.
+  // ---------------------------------------------------------------------------
+  var BTN_STYLE = {
+    background: "#2a4a6a", color: "#eee", border: "1px solid #444",
+    borderRadius: 4, padding: "5px 10px", cursor: "pointer",
+    fontFamily: "ui-sans-serif, system-ui", fontSize: 12,
+  };
+
+  function TrajectoriesTab(props) {
+    var selectedScene = props.selectedScene;
+
+    var toolbar = h("div", {
+      key: "traj-toolbar",
+      style: { display: "flex", gap: 8, padding: "8px 12px",
+               alignItems: "center", borderBottom: "1px solid #2c2c2c",
+               background: "#171717" },
+    }, [
+      h("button", { key: "build", style: BTN_STYLE, disabled: true,
+                    title: "Coming soon" }, "Build trajectories"),
+      h("button", { key: "filter", style: BTN_STYLE, disabled: true,
+                    title: "Coming soon" }, "Filter trajectories"),
+      h("label", { key: "saved", style: { marginLeft: "auto", fontSize: 12,
+                    color: "#ddd", fontFamily: "ui-sans-serif, system-ui" } }, [
+        "Saved filter: ",
+        h("select", { key: "saved-sel", disabled: true,
+                      style: { background: "#222", color: "#888",
+                               border: "1px solid #444" } },
+          [h("option", { key: "_none", value: "" }, "(none)")]),
+      ]),
+    ]);
+
+    var grid = h("div", {
+      key: "traj-grid",
+      style: { padding: 24, color: "#888", fontFamily: "ui-sans-serif, system-ui",
+               fontSize: 13, textAlign: "center" },
+    }, selectedScene
+        ? "No trajectories yet. Build trajectories to populate this grid."
+        : "Load a tracking dataset to begin.");
+
+    return h("div", { style: { display: "flex", flexDirection: "column" } },
+             [toolbar, grid]);
+  }
+
+
+  // ---------------------------------------------------------------------------
   // Main panel
   // ---------------------------------------------------------------------------
   function BEVPanel(props) {
@@ -972,6 +1023,7 @@
       });
     };
 
+    var [activeTab, setActiveTab] = useState("scene");   // "scene" | "trajectories"
     var [viewMode, setViewMode] = useState("base");      // "base" | "world"
     var [scrubFrameIdx, setScrubFrameIdx] = useState(null);
     var [hoveredInstanceId, setHoveredInstanceId] = useState(null);
@@ -1214,7 +1266,7 @@
                background: "#171717", color: "#ddd",
                fontFamily: "ui-sans-serif, system-ui", fontSize: 12 },
     }, [
-      h("strong", { key: "ttl" }, "BEV Track Visualization"),
+      h("strong", { key: "ttl" }, "Scene"),
 
       sceneOptions.length > 1
         ? h("label", { key: "scene-pick" }, [
@@ -1402,11 +1454,46 @@
       maxHeight: timelineMaxH,
     }));
 
+    // ---- Tab bar ----
+    // Generic Object Tracking panel: a "Scene" tab (the BEV scene viz) and a
+    // "Trajectories" tab (ephemeral-tracklet workflow). Modeled on the
+    // existing viewMode pattern: one state var + conditional content.
+    function tabBtn(key, label) {
+      var active = activeTab === key;
+      return h("button", {
+        key: "tab-" + key,
+        onClick: function () { setActiveTab(key); },
+        style: {
+          background: active ? "#1c1c1c" : "transparent",
+          color: active ? "#fff" : "#aaa",
+          border: "none",
+          borderBottom: active ? "2px solid #4a90d9" : "2px solid transparent",
+          padding: "8px 16px", cursor: "pointer",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 13,
+          fontWeight: active ? 600 : 400,
+        },
+      }, label);
+    }
+
+    var tabBar = h("div", {
+      key: "tabbar",
+      style: { display: "flex", gap: 4, padding: "0 8px",
+               borderBottom: "1px solid #2c2c2c", background: "#141414" },
+    }, [tabBtn("scene", "Scene"), tabBtn("trajectories", "Trajectories")]);
+
+    var sceneTab = h("div", { key: "scene-tab" },
+                     [header, bevBlock, scrubberBlock, timelineBlock]);
+
     return h("div", {
       style: {
         background: "#1c1c1c", color: "#eee", height: "100%", overflow: "auto",
       },
-    }, [header, bevBlock, scrubberBlock, timelineBlock]);
+    }, [
+      tabBar,
+      activeTab === "scene"
+        ? sceneTab
+        : h(TrajectoriesTab, { key: "traj-tab", selectedScene: selectedScene }),
+    ]);
   }
 
 
@@ -1704,16 +1791,20 @@
   // Registration
   // ---------------------------------------------------------------------------
   fop.registerComponent({
-    name: "BEVTrackVisualization",
-    label: "BEV Track Visualization",
+    name: "ObjectTracking",
+    label: "Object Tracking",
     component: BEVPanel,
     type: fop.PluginComponentType.Panel,
     activator: function () { return true; },
     panelOptions: {
       surfaces: "grid modal",
       helpMarkdown:
-        "Per-scene bird's-eye-view of object trajectories with a timeline " +
-        "scrubber.\n\n" +
+        "Generic object-tracking panel.\n\n" +
+        "**Scene tab:** per-scene bird's-eye-view of object trajectories " +
+        "with a timeline scrubber.\n\n" +
+        "**Trajectories tab:** build ephemeral tracklets from the tracking " +
+        "dataset, filter them by one or more conditions, and browse them as " +
+        "an in-panel grid.\n\n" +
         "**Grid surface (recommended):** scrubbing highlights the matching " +
         "lidar sample in the grid without opening the modal. Use the " +
         "**Open in modal** button to pop the looker open at the scrubbed " +

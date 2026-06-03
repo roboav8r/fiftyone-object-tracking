@@ -2,13 +2,13 @@ name: "@roboav8r/fiftyone-object-tracking"
 version: 0.2.0
 description: >
   FiftyOne plugin for working with grouped 3D tracking datasets:
-  build per-trajectory datasets (BEV thumbnails rendered server-side
-  with matplotlib) from a tracking source, and browse scenes in a
-  BEVTrackVisualization panel with a timeline scrubber.
+  a generic Object Tracking panel with a per-scene bird's-eye-view
+  (timeline scrubber) and an ephemeral-trajectory workflow (build,
+  filter, browse) computed on demand from a tracking source.
 fiftyone:
   version: ">=2.18.0"
 panels:
-  - BEVTrackVisualization
+  - ObjectTracking
 operators:
   - list_tracking_scenes
   - get_scene_track_payload
