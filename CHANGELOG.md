@@ -8,6 +8,32 @@ once it leaves `0.x`.
 
 ## [Unreleased]
 
+### Changed
+
+- **The panel is now a generic `ObjectTracking` panel with two tabs.**
+  Renamed from `BEVTrackVisualization` (breaks references to the old panel
+  name in saved workspaces). The **Scene** tab is the previous per-scene
+  BEV visualization; the new **Trajectories** tab builds, filters, and
+  browses trajectories in-panel.
+- **Trajectories are now ephemeral — no trajectories dataset is created.**
+  `build_trajectories` no longer materializes a per-trajectory FiftyOne
+  dataset; it extracts tracklets (scalars + per-frame XY) into a
+  dataset-scoped `ExecutionStore`. Removed `_schema.py`, `_thumbnail.py`,
+  and the `matplotlib` dependency.
+
+### Added
+
+- **Trajectories tab.** In-panel grid of client-side mini-BEV thumbnails;
+  clicking a cell opens that track's patches via `view_track_patches`.
+- **`get_trajectories`** (unlisted) — reads built tracklets + the current
+  filter selection for the grid.
+- **`filter_trajectories`** — select tracklets by one or more field/op/value
+  conditions (numeric/categorical/boolean) combined with AND/OR; writes a
+  `{scene: [track_idx]}` selection for QC or scene/data mining.
+- **Per-user saveable filters** — `filter_trajectories` can `save_as` a
+  named spec in a global store keyed by user; `list_trajectory_filters` /
+  `delete_trajectory_filter` back the tab's saved-filters dropdown.
+
 ### Fixed
 
 - **BEV panel camera-mirror thumbnail now renders local media.** The
