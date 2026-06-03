@@ -16,3 +16,4 @@ operators:
   - view_track_patches
   - build_trajectories
   - get_trajectories
+  - filter_trajectories

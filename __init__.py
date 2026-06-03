@@ -511,6 +511,156 @@ class GetTrajectories(foo.Operator):
 
 
 # -----------------------------------------------------------------------------
+# filter_trajectories — select tracklets matching one or more conditions
+# -----------------------------------------------------------------------------
+
+# Tracklet fields exposed to the condition builder, grouped by value kind so
+# the UI / evaluator can pick sensible operators.
+_FILTER_NUM_FIELDS = (
+    "n_frames", "duration_s", "max_gap_s", "max_step_jump_m",
+    "displacement_m", "path_length_m", "straightness",
+    "mean_speed_m_s", "max_speed_m_s", "n_distinct_classes", "n_fragments",
+    "start_distance_m_base", "end_distance_m_base", "closest_approach_m_base",
+)
+_FILTER_CAT_FIELDS = (
+    "tracking_name", "kind", "heading_class",
+    "start_quadrant_base", "end_quadrant_base",
+)
+_FILTER_BOOL_FIELDS = (
+    "is_fragmented", "is_stationary", "side_pass", "crosses_ego_path",
+)
+_FILTER_FIELDS = _FILTER_NUM_FIELDS + _FILTER_CAT_FIELDS + _FILTER_BOOL_FIELDS
+_FILTER_OPS = ("<", "<=", ">", ">=", "==", "!=", "in", "not in")
+
+
+def _coerce_num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(x):
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    return None
+
+
+def _eval_condition(tracklet: dict, cond: dict) -> bool:
+    """Evaluate one {field, op, value} condition against a tracklet."""
+    field = cond.get("field")
+    op = cond.get("op")
+    raw = cond.get("value")
+    if not field or not op:
+        return False
+    actual = tracklet.get(field)
+
+    if op in ("<", "<=", ">", ">="):
+        a, b = _coerce_num(actual), _coerce_num(raw)
+        if a is None or b is None:
+            return False
+        return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
+
+    if op in ("in", "not in"):
+        vals = [v.strip() for v in str(raw).split(",") if v.strip()]
+        member = str(actual) in vals
+        return member if op == "in" else not member
+
+    # "==" / "!=": bool-aware, then numeric-aware, else string compare.
+    if isinstance(actual, bool):
+        b = _coerce_bool(raw)
+        eq = (b is not None and actual == b)
+    else:
+        an, bn = _coerce_num(actual), _coerce_num(raw)
+        eq = (an == bn) if (an is not None and bn is not None) else (str(actual) == str(raw))
+    return eq if op == "==" else not eq
+
+
+def _eval_tracklet(tracklet: dict, conditions: list, combinator: str) -> bool:
+    results = [_eval_condition(tracklet, c) for c in conditions]
+    return all(results) if combinator == "all" else any(results)
+
+
+class FilterTrajectories(foo.Operator):
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="filter_trajectories",
+            label="Filter trajectories",
+            description=(
+                "Select built tracklets matching one or more conditions "
+                "(QC or scene/data mining). Writes a {scene: [track_idx]} "
+                "selection that the Trajectories tab grid reflects."
+            ),
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        combinator = types.Choices()
+        combinator.add_choice("all", label="Match ALL conditions (AND)")
+        combinator.add_choice("any", label="Match ANY condition (OR)")
+        inputs.enum(
+            "combinator", combinator.values(), default="all", view=combinator,
+            label="Combine", required=True,
+        )
+        condition = types.Object()
+        condition.enum(
+            "field", list(_FILTER_FIELDS), required=True, label="Field",
+        )
+        condition.enum(
+            "op", list(_FILTER_OPS), default=">", required=True, label="Op",
+        )
+        condition.str(
+            "value", required=True, label="Value",
+            description="Number, string, true/false, or comma-list for in/not in "
+                        "(e.g. back_left,back_right).",
+        )
+        inputs.list(
+            "conditions", condition, label="Conditions",
+            description="Each row is a field/op/value test over tracklet scalars.",
+        )
+        return types.Property(inputs, view=types.View(label="Filter trajectories"))
+
+    def execute(self, ctx) -> dict[str, Any]:
+        store = ctx.store(STORE_NAME)
+        meta = store.get("meta") or {}
+        scenes = list(meta.get("scenes", []))
+        conditions = ctx.params.get("conditions") or []
+        combinator = ctx.params.get("combinator") or "all"
+
+        # No conditions → clear any active selection (show everything).
+        if not conditions:
+            store.delete("filter_selection")
+            return {"cleared": True, "n_checked": 0, "n_matched": 0}
+
+        selection: dict[str, list] = {}
+        n_checked = 0
+        n_matched = 0
+        for s in scenes:
+            rows = store.get(f"tracklets:{s}") or []
+            for t in rows:
+                n_checked += 1
+                if _eval_tracklet(t, conditions, combinator):
+                    selection.setdefault(s, []).append(int(t["track_idx"]))
+                    n_matched += 1
+
+        summary = {"n_checked": n_checked, "n_matched": n_matched,
+                   "by_scene": {s: len(v) for s, v in selection.items()}}
+        store.set("filter_selection", {
+            "updated": time.time(),
+            "spec": {"combinator": combinator, "conditions": conditions},
+            "selection": selection,
+            "summary": summary,
+        })
+        return summary
+
+
+# -----------------------------------------------------------------------------
 # 4. get_camera_frame_urls — per-(scene, camera) image URLs by frame_idx
 # -----------------------------------------------------------------------------
 
@@ -783,3 +933,4 @@ def register(p):
     p.register(ViewTrackPatches)
     p.register(BuildTrajectories)
     p.register(GetTrajectories)
+    p.register(FilterTrajectories)

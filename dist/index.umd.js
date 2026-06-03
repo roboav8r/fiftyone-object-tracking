@@ -1025,6 +1025,7 @@
     var selectedScene = props.selectedScene;
     var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
+    var filterOp = foo.useOperatorExecutor(OP("filter_trajectories"));
     var promptInput = foo.usePromptOperatorInput();
 
     var [rows, setRows] = useState([]);
@@ -1104,8 +1105,32 @@
           } catch (e) { console.error("[obj-track] prompt build throw", e); }
         },
       }, "Build trajectories"),
-      h("button", { key: "filter", style: BTN_DISABLED, disabled: true,
-                    title: "Coming soon" }, "Filter trajectories"),
+      h("button", {
+        key: "filter",
+        style: (rows.length === 0) ? BTN_DISABLED : BTN_STYLE,
+        disabled: rows.length === 0,
+        title: (rows.length === 0)
+          ? "Build trajectories first"
+          : "Select trajectories matching one or more conditions",
+        onClick: function () {
+          if (rows.length === 0) return;
+          try {
+            promptInput(OP("filter_trajectories"), {});
+            setPolling(true);
+          } catch (e) { console.error("[obj-track] prompt filter throw", e); }
+        },
+      }, "Filter trajectories"),
+      filterActive
+        ? h("button", {
+            key: "clear", style: BTN_STYLE, title: "Clear the active filter",
+            onClick: function () {
+              try {
+                filterOp.execute({ conditions: [] });
+                setPolling(true);
+              } catch (e) { console.error("[obj-track] clear filter throw", e); }
+            },
+          }, "Clear filter")
+        : null,
       h("button", {
         key: "refresh", style: BTN_STYLE, title: "Reload from the store",
         onClick: function () { setRefreshTick(function (x) { return x + 1; }); },
