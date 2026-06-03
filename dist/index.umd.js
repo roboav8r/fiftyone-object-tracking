@@ -952,21 +952,169 @@
     fontFamily: "ui-sans-serif, system-ui", fontSize: 12,
   };
 
+  var BTN_DISABLED = Object.assign({}, BTN_STYLE, {
+    background: "#333", color: "#888", cursor: "not-allowed",
+  });
+
+  // Small ego-relative BEV plot of one tracklet's path, drawn from the
+  // per-frame XY arrays the build operator serialized. Same axis
+  // convention as the Scene tab's BEVChart (forward = up, +left = left).
+  function TrajectoryThumb(props) {
+    var t = props.tracklet;
+    var size = props.size || 132;
+    // Ego sits at its base-frame origin, so plot its scene-local path;
+    // objects plot their base-frame path relative to the ego at origin.
+    var xy = (t.kind === "ego" && t.xy_scene_local && t.xy_scene_local.length)
+      ? t.xy_scene_local : (t.xy_base || []);
+
+    var xs = [], ys = [];
+    for (var i = 0; i < xy.length; i++) {
+      if (isFiniteNum(xy[i][0]) && isFiniteNum(xy[i][1])) {
+        xs.push(xy[i][0]); ys.push(xy[i][1]);
+      }
+    }
+    var bg = { width: size, height: size, background: "#0a0a0a",
+               borderRadius: 3, display: "block" };
+    if (xs.length === 0) return h("svg", { width: size, height: size, style: bg });
+
+    var xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
+    var yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
+    // Objects: force-include the ego origin so the path reads relative to it.
+    if (t.kind !== "ego") {
+      xMin = Math.min(xMin, 0); xMax = Math.max(xMax, 0);
+      yMin = Math.min(yMin, 0); yMax = Math.max(yMax, 0);
+    }
+    var span = Math.max(xMax - xMin, yMax - yMin, 1);
+    var pad = 0.12 * span;
+    xMin -= pad; xMax += pad; yMin -= pad; yMax += pad;
+    var dX = xMax - xMin, dY = yMax - yMin;
+    var s = Math.min(size / dY, size / dX);
+    var ox = (size - s * dY) / 2, oy = (size - s * dX) / 2;
+    function proj(x, y) {
+      // forward (x) → screen y inverted; left (y) → screen x inverted.
+      return [ox + s * (yMax - y), oy + s * (xMax - x)];
+    }
+    var pts = [];
+    for (var k = 0; k < xs.length; k++) {
+      var p = proj(xs[k], ys[k]);
+      pts.push(p[0].toFixed(1) + "," + p[1].toFixed(1));
+    }
+    var color = instanceColor(t.tracking_name, t.instance_id);
+    var p0 = proj(xs[0], ys[0]);
+    var pN = proj(xs[xs.length - 1], ys[ys.length - 1]);
+    var origin = proj(0, 0);
+    var kids = [
+      h("polyline", { key: "path", points: pts.join(" "), fill: "none",
+                      stroke: color, strokeWidth: 1.6 }),
+      h("circle", { key: "start", cx: p0[0], cy: p0[1], r: 3, fill: "none",
+                    stroke: color, strokeWidth: 1.4 }),
+      h("circle", { key: "end", cx: pN[0], cy: pN[1], r: 2.4, fill: color }),
+    ];
+    if (t.kind !== "ego") {
+      kids.push(h("circle", { key: "ego", cx: origin[0], cy: origin[1], r: 2.6,
+                              fill: "#2bff7f", stroke: "#0a0a0a",
+                              strokeWidth: 0.7 }));
+    }
+    return h("svg", { width: size, height: size, style: bg }, kids);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Trajectories tab — build ephemeral tracklets and browse them as a grid.
+  // ---------------------------------------------------------------------------
   function TrajectoriesTab(props) {
     var selectedScene = props.selectedScene;
+    var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
+    var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
+    var promptInput = foo.usePromptOperatorInput();
+
+    var [rows, setRows] = useState([]);
+    var [meta, setMeta] = useState(null);
+    var [filterInfo, setFilterInfo] = useState(null);
+    var [loaded, setLoaded] = useState(false);
+    var [refreshTick, setRefreshTick] = useState(0);
+    var [polling, setPolling] = useState(false);
+
+    // Fire get_trajectories on scene change / explicit refresh.
+    useEffect(function () {
+      try { getTrajOp.execute({ scene_name: selectedScene || null }); }
+      catch (e) { console.error("[obj-track] get_trajectories throw", e); }
+    }, [selectedScene, refreshTick]);
+
+    // Consume get_trajectories result.
+    var lastConsumed = useRef(null);
+    useEffect(function () {
+      var r = getTrajOp.result;
+      if (!r || r === lastConsumed.current) return;
+      lastConsumed.current = r;
+      var out = r.result || r;
+      setRows((out && out.tracklets) || []);
+      setMeta((out && out.meta) || null);
+      setFilterInfo((out && out.filter) || null);
+      setLoaded(true);
+    }, [getTrajOp.result]);
+
+    // After a Build, poll briefly until the store's data lands (the 2.16
+    // operator prompt doesn't expose a success callback).
+    useEffect(function () {
+      if (!polling) return;
+      var n = 0;
+      var iv = setInterval(function () {
+        n += 1;
+        setRefreshTick(function (x) { return x + 1; });
+        if (n >= 10) { clearInterval(iv); setPolling(false); }
+      }, 1500);
+      return function () { clearInterval(iv); };
+    }, [polling]);
+
+    function openCellPatches(t) {
+      if (t.kind === "ego" || !t.scene_name) return;  // ego has no detections
+      try {
+        viewPatchesOp.execute({
+          scene_name: t.scene_name, instance_ids: [t.instance_id],
+        });
+      } catch (e) { console.error("[obj-track] view_track_patches throw", e); }
+    }
+
+    // Filter selection (Stage 3): when active, show only matched tracklets.
+    var filterActive = !!(filterInfo && filterInfo.active);
+    var shown = filterActive ? rows.filter(function (t) { return t._matched; }) : rows;
+
+    var status = !loaded ? "Loading…"
+      : (rows.length === 0
+          ? "No trajectories built yet."
+          : (filterActive
+              ? (shown.length + " of " + rows.length + " match the filter")
+              : (rows.length + " trajectories"
+                 + (meta && meta.scenes ? " · " + meta.scenes.length + " scene(s)" : ""))));
 
     var toolbar = h("div", {
       key: "traj-toolbar",
       style: { display: "flex", gap: 8, padding: "8px 12px",
                alignItems: "center", borderBottom: "1px solid #2c2c2c",
-               background: "#171717" },
+               background: "#171717", flexWrap: "wrap" },
     }, [
-      h("button", { key: "build", style: BTN_STYLE, disabled: true,
-                    title: "Coming soon" }, "Build trajectories"),
-      h("button", { key: "filter", style: BTN_STYLE, disabled: true,
+      h("button", {
+        key: "build", style: BTN_STYLE,
+        title: "Extract trajectories from this dataset",
+        onClick: function () {
+          try {
+            promptInput(OP("build_trajectories"),
+                        { scene: selectedScene || "__all__" });
+            setPolling(true);
+          } catch (e) { console.error("[obj-track] prompt build throw", e); }
+        },
+      }, "Build trajectories"),
+      h("button", { key: "filter", style: BTN_DISABLED, disabled: true,
                     title: "Coming soon" }, "Filter trajectories"),
+      h("button", {
+        key: "refresh", style: BTN_STYLE, title: "Reload from the store",
+        onClick: function () { setRefreshTick(function (x) { return x + 1; }); },
+      }, "↻"),
+      h("span", { key: "status", style: { marginLeft: 8, fontSize: 12,
+                   color: "#aaa", fontFamily: "ui-sans-serif, system-ui" } },
+        status + (polling ? " · building…" : "")),
       h("label", { key: "saved", style: { marginLeft: "auto", fontSize: 12,
-                    color: "#ddd", fontFamily: "ui-sans-serif, system-ui" } }, [
+                    color: "#888", fontFamily: "ui-sans-serif, system-ui" } }, [
         "Saved filter: ",
         h("select", { key: "saved-sel", disabled: true,
                       style: { background: "#222", color: "#888",
@@ -975,13 +1123,42 @@
       ]),
     ]);
 
-    var grid = h("div", {
-      key: "traj-grid",
-      style: { padding: 24, color: "#888", fontFamily: "ui-sans-serif, system-ui",
-               fontSize: 13, textAlign: "center" },
-    }, selectedScene
-        ? "No trajectories yet. Build trajectories to populate this grid."
-        : "Load a tracking dataset to begin.");
+    var cells = shown.map(function (t, idx) {
+      var clickable = t.kind !== "ego";
+      return h("div", {
+        key: (t.scene_name || "") + ":" + t.track_idx + ":" + idx,
+        onClick: function () { openCellPatches(t); },
+        title: clickable ? "Show this track's patches" : "Ego trajectory",
+        style: {
+          background: "#161616", border: "1px solid #2c2c2c", borderRadius: 4,
+          padding: 8, cursor: clickable ? "pointer" : "default",
+          display: "flex", flexDirection: "column", gap: 4, width: 148,
+        },
+      }, [
+        h(TrajectoryThumb, { key: "thumb", tracklet: t, size: 130 }),
+        h("div", { key: "lbl", style: { fontSize: 11, color: "#eee",
+                    fontFamily: "ui-sans-serif, system-ui",
+                    whiteSpace: "nowrap", overflow: "hidden",
+                    textOverflow: "ellipsis" } },
+          (t.tracking_name || "?") + " #" + t.track_idx),
+        h("div", { key: "meta", style: { fontSize: 10, color: "#999",
+                    fontFamily: "ui-monospace, monospace" } },
+          t.n_frames + "f · gap " + (t.max_gap_s || 0).toFixed(1) + "s"
+          + (t.n_distinct_classes > 1 ? " · ⚠cls" : "")),
+      ]);
+    });
+
+    var grid = (shown.length === 0)
+      ? h("div", { key: "empty", style: { padding: 24, color: "#888",
+                    fontFamily: "ui-sans-serif, system-ui", fontSize: 13,
+                    textAlign: "center" } },
+          loaded
+            ? (rows.length === 0
+                ? "No trajectories yet. Click \"Build trajectories\" to populate this grid."
+                : "No trajectories match the current filter.")
+            : "Loading…")
+      : h("div", { key: "grid", style: { display: "flex", flexWrap: "wrap",
+                    gap: 10, padding: 12 } }, cells);
 
     return h("div", { style: { display: "flex", flexDirection: "column" } },
              [toolbar, grid]);

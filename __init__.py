@@ -1,28 +1,30 @@
 """Operators for the FiftyOne object-tracking toolkit plugin.
 
-Three operators, exposed through ``register()``:
+Powers the ``ObjectTracking`` panel. Operators exposed through
+``register()``:
 
   - ``list_tracking_scenes``    (unlisted) — enumerate scenes +
-                                group-slice names for the BEV panel
+                                group-slice names for the Scene tab
   - ``get_scene_track_payload`` (unlisted) — one-shot per-scene
-                                trajectory bundle for the BEV panel
-  - ``build_trajectories``      (listed)   — consume a grouped
-                                tracking dataset and emit a sibling
-                                per-trajectory dataset, with each
-                                trajectory rendered as a single BEV
-                                PNG by matplotlib. FO's built-in
-                                image renderer handles the grid +
-                                modal; no custom JS sample renderer
-                                and no PyArrow / Parquet roundtrip
-                                in the loop.
+                                trajectory bundle for the Scene tab
+  - ``get_camera_frame_urls``   (unlisted) — per-(scene, camera)
+                                frame URLs for the camera mirror
+  - ``view_track_patches``      (unlisted) — flatten the App view to
+                                one-patch-per-detection for a track
+  - ``build_trajectories``      (listed)   — extract ephemeral
+                                tracklets from the tracking dataset
+                                into an ExecutionStore (no dataset is
+                                created); the Trajectories tab reads
+                                them back via ``get_trajectories``
+  - ``get_trajectories``        (unlisted) — read built tracklets (+
+                                the current filter selection) for the
+                                Trajectories tab grid
 """
 
 from __future__ import annotations
 
 import math
-import os
-import shutil
-import tempfile
+import time
 from typing import Any
 
 import numpy as np
@@ -38,12 +40,6 @@ from ._records import (
     TrajectoryRecord,
     build_track_records,
 )
-from ._schema import (
-    SAMPLE_SCHEMA,
-    declare_schema,
-    set_sidebar_groups,
-)
-from ._thumbnail import render_trajectory_thumbnail
 
 
 DEFAULT_LIDAR_SLICE = "lidar"
@@ -66,6 +62,14 @@ def _footprint_corners(cx: float, cy: float, yaw: float,
     hL, hW = length / 2.0, width / 2.0
     local = ((+hL, +hW), (+hL, -hW), (-hL, -hW), (-hL, +hW))
     return [(cx + c * lx - s * ly, cy + s * lx + c * ly) for lx, ly in local]
+
+
+def _resolve_lidar_slice(group_slices) -> str | None:
+    """Pick the lidar group slice: exact ``lidar`` else first ``*lidar*``."""
+    slices = list(group_slices or [])
+    if DEFAULT_LIDAR_SLICE in slices:
+        return DEFAULT_LIDAR_SLICE
+    return next((s for s in slices if "lidar" in s.lower()), None)
 
 
 # -----------------------------------------------------------------------------
@@ -293,93 +297,80 @@ class GetSceneTrackPayload(foo.Operator):
 # 3. build_trajectories — the user-facing operator
 # -----------------------------------------------------------------------------
 
-def _record_to_sample(record: TrajectoryRecord, filepath: str) -> fo.Sample:
-    sample = fo.Sample(filepath=filepath, tags=[record.kind, record.scene_name])
-    for field in SAMPLE_SCHEMA:
-        sample[field] = getattr(record, field)
-    return sample
+# Name of the dataset-scoped ExecutionStore that holds built tracklets +
+# the current filter selection. The Trajectories tab reads it back via
+# get_trajectories; nothing is persisted as FiftyOne samples.
+STORE_NAME = "object_tracking"
+
+# Scalar fields copied verbatim from a TrajectoryRecord into a tracklet
+# dict. Per-frame arrays are handled separately (downsampled to XY).
+_TRACKLET_SCALARS = (
+    "kind", "instance_id", "tracking_id", "tracking_name", "scene_name",
+    "n_frames", "duration_s", "frame_idx_first", "frame_idx_last",
+    "is_fragmented", "n_fragments", "is_stationary",
+    "start_quadrant_base", "end_quadrant_base",
+    "start_distance_m_base", "end_distance_m_base", "closest_approach_m_base",
+    "displacement_m", "path_length_m", "straightness",
+    "heading_change_deg", "heading_class", "side_pass", "crosses_ego_path",
+    "mean_speed_m_s", "max_speed_m_s",
+    # QC
+    "n_distinct_classes", "tracking_names_distinct",
+    "max_step_jump_m", "max_gap_s",
+)
 
 
-def _create_or_overwrite(name: str, overwrite: bool) -> fo.Dataset:
-    if name in fo.list_datasets():
-        if not overwrite:
-            raise RuntimeError(
-                f"Target dataset {name!r} already exists; pass overwrite=True"
-            )
-        fo.delete_dataset(name)
-    return fo.Dataset(name=name, persistent=True)
+def _json_scalar(v):
+    """Coerce numpy/str/bool scalars to JSON-able Python values."""
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [_json_scalar(x) for x in v]
+    return v
 
 
-def _build_trajectories(
-    *, source: str, target: str, trajectory_root: str, overwrite: bool,
-) -> fo.Dataset:
-    """Core build logic; the operator wraps this.
+def _xy_list(arr) -> list[list[float]]:
+    """First two columns of an Nx2/Nx3 array as a JSON-able list of [x, y]."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim != 2 or a.shape[0] == 0:
+        return []
+    return [[float(row[0]), float(row[1])] for row in a]
 
-    Each trajectory is rendered to a single PNG (BEV plot) via
-    matplotlib at build time; ``sample.filepath`` points at the PNG
-    and FO's built-in image renderer handles the grid + modal. No
-    PyArrow / Parquet / custom JS renderer in the loop.
+
+def _record_to_tracklet(record: TrajectoryRecord, track_idx: int) -> dict:
+    """Serialize one TrajectoryRecord to a JSON-able tracklet dict.
+
+    ``track_idx`` is the trajectory's index within its scene's record
+    list (ego first when present) — the identifier the filter operator
+    returns as ``{scene_name: [track_idx, ...]}``.
     """
-    src = fo.load_dataset(source)
-    tgt = _create_or_overwrite(target, overwrite=overwrite)
-    declare_schema(tgt)
-    set_sidebar_groups(tgt)
+    out = {"track_idx": int(track_idx)}
+    for name in _TRACKLET_SCALARS:
+        out[name] = _json_scalar(getattr(record, name))
+    out["tracking_id"] = str(out["tracking_id"])
+    # Per-frame XY for the in-panel mini-BEV thumbnail (base + world; ego
+    # also carries scene-local so its path isn't a degenerate dot).
+    out["frame_indices"] = [int(x) for x in np.asarray(record.frame_indices).tolist()]
+    out["fragment_ids"] = [int(x) for x in np.asarray(record.fragment_ids).tolist()]
+    out["xy_base"] = _xy_list(record.translations_base)
+    out["xy_world"] = _xy_list(record.translations_world)
+    out["xy_scene_local"] = _xy_list(record.translations_scene_local)
+    return out
 
-    scenes = sorted(src.distinct("scene_name"))
-    ego_size = list(
-        (src.info or {}).get("ego_size_lwh_m") or DEFAULT_EGO_SIZE_LWH
-    )
-    print(f"[build_trajectories] source={source} target={target} scenes={scenes} "
-          f"ego_size_lwh_m={ego_size}")
 
-    tgt.info = {
-        "source_dataset": source,
-        "trajectory_kinds": ["object", "ego"],
-        "ego_size_lwh_m": ego_size,
-        "coord_frames": ["base", "world", "scene_local", "origin_normalized"],
-        "heading_classes": [
-            "straight", "slight_left", "slight_right", "left", "right", "u_turn",
-        ],
-        "quadrants_base": ["front_left", "front_right", "back_left", "back_right"],
-        "trajectory_root": trajectory_root,
-    }
-    tgt.save()
-
-    tmpdir = tempfile.mkdtemp(prefix=f"trajectories-{target}-")
-    print(f"[build_trajectories] rendering BEV thumbnails to {tmpdir}")
-
-    samples: list[fo.Sample] = []
-    for scene_name in scenes:
-        lidar_view = (
-            src.select_group_slices("lidar")
-               .match(F("scene_name") == scene_name)
-               .sort_by("frame_idx")
-        )
-        ego_record, object_records = build_track_records(
-            lidar_view, source_dataset=source, ego_size_lwh=tuple(ego_size),
-        )
-        records = ([ego_record] if ego_record is not None else []) + list(object_records)
-        print(f"[build_trajectories]   {scene_name}: "
-              f"ego={'yes' if ego_record else 'no'} "
-              f"objects={len(object_records)} (total {len(records)})")
-        for record in records:
-            local_path = os.path.join(tmpdir, f"{record.output_stem}.png")
-            render_trajectory_thumbnail(
-                record, local_path, ego_size_lwh=tuple(ego_size),
-            )
-            samples.append(_record_to_sample(record, local_path))
-
-    print(f"[build_trajectories] adding {len(samples)} samples to {target}")
-    tgt.add_samples(samples)
-    tgt.compute_metadata()
-
-    remote_dir = f"{trajectory_root.rstrip('/')}/{target}"
-    print(f"[build_trajectories] uploading thumbnails to {remote_dir}")
-    fos.upload_media(tgt, remote_dir, update_filepaths=True, overwrite=True)
-
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    print(f"[build_trajectories] done: {len(tgt)} trajectories in {target!r}")
-    return tgt
+def _scene_choices(ctx):
+    """Choices for the scene picker: every scene + an 'All scenes' option."""
+    scenes = sorted(ctx.dataset.distinct("scene_name")) if ctx.dataset else []
+    choices = types.Choices()
+    choices.add_choice("__all__", label="All scenes")
+    for s in scenes:
+        choices.add_choice(s, label=s)
+    return scenes, choices
 
 
 class BuildTrajectories(foo.Operator):
@@ -387,67 +378,135 @@ class BuildTrajectories(foo.Operator):
     def config(self):
         return foo.OperatorConfig(
             name="build_trajectories",
-            label="Build trajectories dataset",
+            label="Build trajectories",
             description=(
-                "Build a per-trajectory FiftyOne dataset (one sample per "
-                "(scene, FO instance)) from a grouped tracking dataset. "
-                "Each sample's filepath is a Parquet file with the full "
-                "per-frame trajectory data; sample-level fields are "
-                "filter-friendly scalars grouped under Identity / Coverage "
-                "/ Position / Motion / Shape / QC."
+                "Extract ephemeral per-(scene, instance) tracklets from the "
+                "current tracking dataset into an in-memory store. Nothing "
+                "is persisted as samples; the Trajectories tab renders the "
+                "result as an in-panel grid and the filter operator selects "
+                "across it."
             ),
         )
 
     def resolve_input(self, ctx):
         inputs = types.Object()
-        # Source dataset is the currently-loaded one by default; let the
-        # user pick a different one if needed.
-        inputs.str(
-            "source",
-            label="Source tracking dataset",
-            description="A grouped dataset produced by one of the loaders "
-                        "in fiftyone-tracking-loaders (lidar slice carries "
-                        "the cuboid detections).",
-            default=ctx.dataset.name if ctx.dataset is not None else None,
-            required=True,
+        scenes, choices = _scene_choices(ctx)
+        default_scene = ctx.params.get("scene") or (
+            scenes[0] if scenes else "__all__"
         )
-        inputs.str(
-            "target",
-            label="Target trajectories dataset",
-            description="Name for the new trajectories dataset.",
-            required=True,
+        inputs.enum(
+            "scene", choices.values(), default=default_scene, required=True,
+            view=choices, label="Scene",
+            description="Build trajectories for one scene or all scenes.",
         )
-        inputs.str(
-            "trajectory_root",
-            label="Trajectory root (storage URI)",
-            description="Where to write per-trajectory Parquet files. "
-                        "Local path or any FiftyOne-supported URI (gs://, "
-                        "s3://, ...). For shared FOE deployments use a "
-                        "remote URI that the App can resolve.",
-            default="./trajectories",
-        )
-        inputs.bool(
-            "overwrite",
-            label="Overwrite target if it exists",
-            default=False,
-        )
-        return types.Property(
-            inputs, view=types.View(label="Build trajectories dataset")
-        )
+        return types.Property(inputs, view=types.View(label="Build trajectories"))
 
     def execute(self, ctx) -> dict[str, Any]:
-        source = ctx.params["source"]
-        target = ctx.params["target"]
-        trajectory_root = ctx.params.get("trajectory_root") or "./trajectories"
-        overwrite = bool(ctx.params.get("overwrite", False))
-        ds = _build_trajectories(
-            source=source, target=target,
-            trajectory_root=trajectory_root, overwrite=overwrite,
+        ds = ctx.dataset
+        if ds is None:
+            return {"error": "No dataset loaded."}
+        lidar_slice = _resolve_lidar_slice(ds.group_slices)
+        if lidar_slice is None:
+            return {"error": "No lidar group slice found on this dataset."}
+
+        scene_param = ctx.params.get("scene") or "__all__"
+        all_scenes = sorted(ds.distinct("scene_name"))
+        targets = all_scenes if scene_param == "__all__" else [scene_param]
+        ego_size = tuple(
+            (ds.info or {}).get("ego_size_lwh_m") or DEFAULT_EGO_SIZE_LWH
         )
+
+        store = ctx.store(STORE_NAME)
+        built: list[str] = []
+        total = 0
+        for scene_name in targets:
+            lidar_view = (
+                ds.select_group_slices(lidar_slice)
+                  .match(F("scene_name") == scene_name)
+                  .sort_by("frame_idx")
+            )
+            ego_record, object_records = build_track_records(
+                lidar_view, source_dataset=ds.name, ego_size_lwh=ego_size,
+            )
+            records = (
+                ([ego_record] if ego_record is not None else [])
+                + list(object_records)
+            )
+            tracklets = [
+                _record_to_tracklet(r, i) for i, r in enumerate(records)
+            ]
+            store.set(f"tracklets:{scene_name}", tracklets)
+            built.append(scene_name)
+            total += len(tracklets)
+
+        # A new build invalidates any prior filter selection.
+        store.delete("filter_selection")
+        store.set("meta", {
+            "updated": time.time(),
+            "source": ds.name,
+            "scenes": built,
+            "ego_size_lwh_m": list(ego_size),
+            "n_trajectories": total,
+        })
+        return {"scenes": built, "n_trajectories": total}
+
+
+# -----------------------------------------------------------------------------
+# get_trajectories — read built tracklets (+ filter selection) for the grid
+# -----------------------------------------------------------------------------
+
+class GetTrajectories(foo.Operator):
+    """Return built tracklets for the Trajectories-tab grid.
+
+    Reads the dataset-scoped store populated by ``build_trajectories``.
+    If a ``scene_name`` is given, returns that scene's tracklets; else
+    returns tracklets for every built scene. Each tracklet is tagged
+    ``_matched`` per the current filter selection (if any).
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="get_trajectories",
+            label="Get trajectories",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("scene_name", required=False)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        store = ctx.store(STORE_NAME)
+        meta = store.get("meta") or {}
+        scene = ctx.params.get("scene_name")
+        sel = store.get("filter_selection") or {}
+        selection = sel.get("selection") or {}
+
+        if scene:
+            scenes = [scene]
+        else:
+            scenes = list(meta.get("scenes", []))
+
+        tracklets: list[dict] = []
+        for s in scenes:
+            rows = store.get(f"tracklets:{s}") or []
+            matched_idxs = set(selection.get(s) or [])
+            for t in rows:
+                t["_matched"] = t["track_idx"] in matched_idxs
+            tracklets.extend(rows)
+
         return {
-            "target": target,
-            "n_trajectories": len(ds),
-            "trajectory_root": trajectory_root,
+            "scene_name": scene,
+            "tracklets": tracklets,
+            "meta": meta,
+            "updated": meta.get("updated"),
+            "filter": {
+                "active": bool(sel),
+                "summary": sel.get("summary"),
+                "spec": sel.get("spec"),
+            },
         }
 
 
@@ -723,3 +782,4 @@ def register(p):
     p.register(GetCameraFrameUrls)
     p.register(ViewTrackPatches)
     p.register(BuildTrajectories)
+    p.register(GetTrajectories)

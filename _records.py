@@ -6,9 +6,10 @@ stamped on each Detection) and emits one ``TrajectoryRecord`` per
 (scene, FO instance) plus one ego record per scene.
 
 Per-frame arrays are kept in-memory on the ``TrajectoryRecord``; the
-build operator hands the record to ``_thumbnail.render_trajectory_thumbnail``
-which uses matplotlib to write a PNG to disk. No PyArrow / Parquet
-dependency.
+build operator serializes each record to a JSON-able tracklet dict
+(scalars + per-frame XY) stored in an ExecutionStore, which the
+Trajectories tab renders as a client-side mini-BEV. No PyArrow /
+Parquet dependency.
 """
 
 from __future__ import annotations
@@ -46,10 +47,10 @@ class TrajectoryRecord:
 
     Per-frame arrays (``translations_*``, ``rotations_*``, ``sizes``,
     ``velocities_world``, ``tracking_scores``, ``num_pts``,
-    ``fragment_ids``) are kept in-memory and consumed by
-    ``_thumbnail.render_trajectory_thumbnail`` at build time. All
-    other fields are sample-level scalars surfaced via the FiftyOne
-    App sidebar.
+    ``fragment_ids``) are kept in-memory; ``build_trajectories``
+    serializes the XY tracks for the in-panel mini-BEV thumbnail. All
+    other fields are scalars used as tracklet metadata and filter
+    inputs in the Trajectories tab.
     """
 
     # identity / back-links
@@ -124,8 +125,8 @@ class TrajectoryRecord:
     bbox_world_x_max: float
     bbox_world_y_max: float
 
-    # per-frame arrays — kept in-memory; matplotlib renders the BEV
-    # thumbnail at build time, no external trajectory file written.
+    # per-frame arrays — kept in-memory; build_trajectories serializes
+    # the XY tracks into the tracklet dict for the in-panel mini-BEV.
     frame_indices: np.ndarray
     timestamps_ns: list[Optional[str]]
     timestamps_s: np.ndarray
@@ -141,9 +142,9 @@ class TrajectoryRecord:
     tracking_scores: np.ndarray
     num_pts: np.ndarray
     fragment_ids: np.ndarray
-    # Filename stem (no extension) for the build operator's
-    # per-trajectory PNG. The operator appends ``.png`` and writes
-    # the file via matplotlib.
+    # Stable per-trajectory stem (``{scene}__{kind}__{instance_id}``);
+    # vestigial now that no per-trajectory file is written, but still a
+    # handy unique key.
     output_stem: str
 
 
