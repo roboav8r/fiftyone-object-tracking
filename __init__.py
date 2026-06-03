@@ -495,19 +495,30 @@ class GetCameraFrameUrls(foo.Operator):
             F("scene_name") == scene_name
         ).sort_by("frame_idx")
         frame_idxs, filepaths = view.values(["frame_idx", "filepath"])
-        # Resolve each filepath into a browser-loadable URL — fos.get_url
-        # returns a signed URL for gs:// / s3:// paths, or the raw path
-        # for already-HTTP / local FS paths. Cached client-side per
-        # (scene, slice); the JS layer doesn't re-fire unless the user
-        # changes either.
+        # Resolve each filepath into a value the JS layer can turn into a
+        # browser-loadable URL:
+        #   * HTTP            -> already loadable; pass through
+        #   * LOCAL           -> raw path; the frontend routes it through the
+        #                        App's /media server via fos.getSampleSrc
+        #                        (fos.get_url would *raise* here — local file
+        #                        systems don't support signed URLs)
+        #   * cloud (GCS/S3/  -> signed URL
+        #     Azure/MinIO)
+        # Cached client-side per (scene, slice); the JS layer doesn't re-fire
+        # unless the user changes either.
+        passthrough_fs = (fos.FileSystem.HTTP, fos.FileSystem.LOCAL)
         frame_urls = {}
         for fi, fp in zip(frame_idxs, filepaths):
             if fi is None or not fp:
                 continue
-            try:
-                url = fos.get_url(fp)
-            except Exception:
-                url = fp  # fallback; browser may not be able to load it
+            if fos.get_file_system(fp) in passthrough_fs:
+                url = fp
+            else:
+                try:
+                    url = fos.get_url(fp)
+                except Exception as e:
+                    print(f"[get_camera_frame_urls] cannot sign {fp!r}: {e}")
+                    continue
             frame_urls[str(int(fi))] = url
         return {
             "scene_name": scene_name,

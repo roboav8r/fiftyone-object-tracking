@@ -46,6 +46,25 @@
   // Utilities
   // ---------------------------------------------------------------------------
 
+  // Resolve a media path/URL into something an <img> can actually load.
+  // The get_camera_frame_urls operator returns signed https URLs for cloud
+  // media but raw filesystem paths for local media (which the browser can't
+  // load directly). fos.getSampleSrc — the same helper the grid/looker use —
+  // passes http(s)/signed URLs through unchanged and routes local paths
+  // through the App's /media server. Falls back to the raw value on older
+  // FOE builds that don't export it.
+  function resolveMediaSrc(url) {
+    if (!url) return url;
+    try {
+      if (fos && typeof fos.getSampleSrc === "function") {
+        return fos.getSampleSrc(url);
+      }
+    } catch (e) {
+      console.warn("[bev-panel] getSampleSrc failed for", url, e);
+    }
+    return url;
+  }
+
   // Per-class hue palette + per-instance shade jitter. classHue assigns
   // hues to classes in first-seen order so the palette is stable per panel
   // mount. instanceColor jitters lightness + saturation deterministically
@@ -1344,7 +1363,7 @@
           }, [
             h("img", {
               key: "cam-img",
-              src: camFrameUrl,
+              src: resolveMediaSrc(camFrameUrl),
               style: { width: "100%", height: "100%", objectFit: "cover",
                        display: "block" },
             }),

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once it leaves `0.x`.
 
+## [Unreleased]
+
+### Fixed
+
+- **BEV panel camera-mirror thumbnail now renders local media.** The
+  inline thumbnail loaded cloud (gs:///s3://) frames but showed a broken
+  image for local-filesystem datasets: `get_camera_frame_urls` returned a
+  raw local path that the browser can't load. The frontend now resolves
+  every thumbnail URL through `fos.getSampleSrc`, which passes signed/HTTP
+  URLs through unchanged and routes local paths through the App's `/media`
+  server. The operator now classifies paths explicitly by file system
+  (HTTP/local pass through; cloud is signed) instead of relying on a broad
+  `except` around `fos.get_url`.
+
 ## [0.2.0] — 2026-05-19
 
 Initial public release. Renames the plugin to its shipping namespace
