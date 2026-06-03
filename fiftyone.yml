@@ -17,3 +17,5 @@ operators:
   - build_trajectories
   - get_trajectories
   - filter_trajectories
+  - list_trajectory_filters
+  - delete_trajectory_filter

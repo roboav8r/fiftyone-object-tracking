@@ -1026,6 +1026,8 @@
     var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
     var filterOp = foo.useOperatorExecutor(OP("filter_trajectories"));
+    var listFiltersOp = foo.useOperatorExecutor(OP("list_trajectory_filters"));
+    var deleteFilterOp = foo.useOperatorExecutor(OP("delete_trajectory_filter"));
     var promptInput = foo.usePromptOperatorInput();
 
     var [rows, setRows] = useState([]);
@@ -1034,6 +1036,8 @@
     var [loaded, setLoaded] = useState(false);
     var [refreshTick, setRefreshTick] = useState(0);
     var [polling, setPolling] = useState(false);
+    var [savedFilters, setSavedFilters] = useState([]);
+    var [selectedSaved, setSelectedSaved] = useState("");
 
     // Fire get_trajectories on scene change / explicit refresh.
     useEffect(function () {
@@ -1053,6 +1057,21 @@
       setFilterInfo((out && out.filter) || null);
       setLoaded(true);
     }, [getTrajOp.result]);
+
+    // Fetch saved filters on mount + on refresh (after save/delete).
+    useEffect(function () {
+      try { listFiltersOp.execute({}); }
+      catch (e) { console.error("[obj-track] list_trajectory_filters throw", e); }
+    }, [refreshTick]);
+
+    var lastFiltersConsumed = useRef(null);
+    useEffect(function () {
+      var r = listFiltersOp.result;
+      if (!r || r === lastFiltersConsumed.current) return;
+      lastFiltersConsumed.current = r;
+      var out = r.result || r;
+      setSavedFilters((out && out.filters) || []);
+    }, [listFiltersOp.result]);
 
     // After a Build, poll briefly until the store's data lands (the 2.16
     // operator prompt doesn't expose a success callback).
@@ -1139,12 +1158,46 @@
                    color: "#aaa", fontFamily: "ui-sans-serif, system-ui" } },
         status + (polling ? " · building…" : "")),
       h("label", { key: "saved", style: { marginLeft: "auto", fontSize: 12,
-                    color: "#888", fontFamily: "ui-sans-serif, system-ui" } }, [
+                    color: "#ddd", fontFamily: "ui-sans-serif, system-ui",
+                    display: "flex", alignItems: "center", gap: 6 } }, [
         "Saved filter: ",
-        h("select", { key: "saved-sel", disabled: true,
-                      style: { background: "#222", color: "#888",
-                               border: "1px solid #444" } },
-          [h("option", { key: "_none", value: "" }, "(none)")]),
+        h("select", {
+          key: "saved-sel", value: selectedSaved,
+          style: { background: "#222", color: "#eee", border: "1px solid #444" },
+          onChange: function (e) {
+            var name = e.target.value;
+            setSelectedSaved(name);
+            if (!name) return;
+            var spec = null;
+            for (var i = 0; i < savedFilters.length; i++) {
+              if (savedFilters[i].name === name) { spec = savedFilters[i]; break; }
+            }
+            if (!spec) return;
+            try {
+              filterOp.execute({ combinator: spec.combinator,
+                                 conditions: spec.conditions });
+              setPolling(true);
+            } catch (err) { console.error("[obj-track] apply saved throw", err); }
+          },
+        }, [h("option", { key: "_none", value: "" }, "(none)")].concat(
+          savedFilters.map(function (f) {
+            return h("option", { key: f.name, value: f.name }, f.name);
+          })
+        )),
+        selectedSaved
+          ? h("button", {
+              key: "del-saved",
+              style: Object.assign({}, BTN_STYLE, { padding: "2px 8px",
+                       background: "#5a2a2a" }),
+              title: "Delete this saved filter",
+              onClick: function () {
+                try { deleteFilterOp.execute({ name: selectedSaved }); }
+                catch (err) { console.error("[obj-track] delete saved throw", err); }
+                setSelectedSaved("");
+                setRefreshTick(function (x) { return x + 1; });
+              },
+            }, "✕")
+          : null,
       ]),
     ]);
 

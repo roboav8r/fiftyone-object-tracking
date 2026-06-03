@@ -624,6 +624,11 @@ class FilterTrajectories(foo.Operator):
             "conditions", condition, label="Conditions",
             description="Each row is a field/op/value test over tracklet scalars.",
         )
+        inputs.str(
+            "save_as", required=False, label="Save filter as",
+            description="Optional: save these conditions under this name for "
+                        "reuse (per user, across datasets).",
+        )
         return types.Property(inputs, view=types.View(label="Filter trajectories"))
 
     def execute(self, ctx) -> dict[str, Any]:
@@ -657,7 +662,88 @@ class FilterTrajectories(foo.Operator):
             "selection": selection,
             "summary": summary,
         })
+
+        save_as = (ctx.params.get("save_as") or "").strip()
+        if save_as:
+            _saved_filter_store().set(_saved_filter_key(ctx, save_as), {
+                "name": save_as,
+                "combinator": combinator,
+                "conditions": conditions,
+                "saved_at": time.time(),
+            })
+            summary["saved_as"] = save_as
         return summary
+
+
+# -----------------------------------------------------------------------------
+# Saved filters — per-user, reusable across datasets (global store)
+# -----------------------------------------------------------------------------
+
+# Filter specs are reusable across datasets, so they live in a GLOBAL store
+# (dataset_id=None), namespaced per user. Built tracklets + the live
+# selection stay in the dataset-scoped ctx.store(STORE_NAME).
+SAVED_FILTERS_STORE = "object_tracking_filters"
+
+
+def _user_key(ctx) -> str:
+    u = getattr(ctx, "user", None)
+    if u is not None:
+        return str(getattr(u, "id", None) or getattr(u, "email", None) or "anon")
+    return "anon"
+
+
+def _saved_filter_store():
+    return foo.ExecutionStore.create(SAVED_FILTERS_STORE, dataset_id=None)
+
+
+def _saved_filter_key(ctx, name: str) -> str:
+    return f"{_user_key(ctx)}:{name}"
+
+
+class ListTrajectoryFilters(foo.Operator):
+    """Return the current user's saved filter specs for the tab dropdown."""
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="list_trajectory_filters",
+            label="List trajectory filters",
+            unlisted=True,
+        )
+
+    def execute(self, ctx) -> dict[str, Any]:
+        store = _saved_filter_store()
+        prefix = _user_key(ctx) + ":"
+        filters = []
+        for key in store.list_keys():
+            if key.startswith(prefix):
+                spec = store.get(key)
+                if spec:
+                    filters.append(spec)
+        filters.sort(key=lambda d: d.get("name", ""))
+        return {"filters": filters}
+
+
+class DeleteTrajectoryFilter(foo.Operator):
+    """Delete one of the current user's saved filter specs by name."""
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="delete_trajectory_filter",
+            label="Delete trajectory filter",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("name", required=True)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        name = ctx.params["name"]
+        deleted = _saved_filter_store().delete(_saved_filter_key(ctx, name))
+        return {"deleted": bool(deleted), "name": name}
 
 
 # -----------------------------------------------------------------------------
@@ -934,3 +1020,5 @@ def register(p):
     p.register(BuildTrajectories)
     p.register(GetTrajectories)
     p.register(FilterTrajectories)
+    p.register(ListTrajectoryFilters)
+    p.register(DeleteTrajectoryFilter)
