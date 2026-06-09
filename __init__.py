@@ -125,6 +125,50 @@ class ListTrackingScenes(foo.Operator):
         }
 
 
+class ResolveSceneForSample(foo.Operator):
+    """Return the ``scene_name`` for a given id, so the modal panel can infer
+    its scene from the open sample. The modal's active id may be any slice's
+    sample (e.g. a camera, not lidar) or the group id, so match on either
+    ``_id`` or ``group._id`` across every group slice (a single indexed lookup
+    per slice, with early exit)."""
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="resolve_scene_for_sample",
+            label="Resolve scene for sample",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("sample_id", required=True)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        from bson import ObjectId
+
+        raw = ctx.params.get("sample_id")
+        try:
+            oid = ObjectId(raw)
+        except Exception:
+            return {"scene_name": None}
+
+        ds = ctx.dataset
+        match = (F("_id") == oid) | (F("group._id") == oid)
+        for sl in list(ds.group_slices or []):
+            try:
+                vals = (
+                    ds.select_group_slices(sl).match(match).limit(1)
+                    .values("scene_name")
+                )
+            except Exception:
+                continue
+            if vals and vals[0]:
+                return {"scene_name": vals[0], "sample_id": str(raw)}
+        return {"scene_name": None, "sample_id": str(raw)}
+
+
 # -----------------------------------------------------------------------------
 # 2. get_scene_track_payload
 # -----------------------------------------------------------------------------
@@ -532,6 +576,25 @@ _FILTER_BOOL_FIELDS = (
 _FILTER_FIELDS = _FILTER_NUM_FIELDS + _FILTER_CAT_FIELDS + _FILTER_BOOL_FIELDS
 _FILTER_OPS = ("<", "<=", ">", ">=", "==", "!=", "in", "not in")
 
+# Human-readable labels for the field dropdown so users aren't confused by the
+# raw field names (notably: `kind` is object/ego, the CLASS lives in
+# `tracking_name`).
+_FIELD_LABELS = {
+    "tracking_name": "Class", "kind": "Kind (object/ego)",
+    "heading_class": "Heading", "start_quadrant_base": "Start quadrant",
+    "end_quadrant_base": "End quadrant",
+    "n_frames": "# frames", "duration_s": "Duration (s)",
+    "max_gap_s": "Max gap (s)", "max_step_jump_m": "Max step jump (m)",
+    "displacement_m": "Displacement (m)", "path_length_m": "Path length (m)",
+    "straightness": "Straightness", "mean_speed_m_s": "Mean speed (m/s)",
+    "max_speed_m_s": "Max speed (m/s)", "n_distinct_classes": "# distinct classes",
+    "n_fragments": "# fragments", "start_distance_m_base": "Start distance (m)",
+    "end_distance_m_base": "End distance (m)",
+    "closest_approach_m_base": "Closest approach (m)",
+    "is_fragmented": "Is fragmented", "is_stationary": "Is stationary",
+    "side_pass": "Side pass", "crosses_ego_path": "Crosses ego path",
+}
+
 
 def _coerce_num(x):
     try:
@@ -586,12 +649,33 @@ def _eval_tracklet(tracklet: dict, conditions: list, combinator: str) -> bool:
     return all(results) if combinator == "all" else any(results)
 
 
+def _field_values(ctx) -> tuple[dict, int]:
+    """Per-field sorted distinct values for each categorical field (so the
+    filter form can suggest only the values valid for the chosen field) plus the
+    total tracklet count (``n`` is 0 when nothing is built yet)."""
+    store = ctx.store(STORE_NAME)
+    meta = store.get("meta") or {}
+    vals = {f: set() for f in _FILTER_CAT_FIELDS}
+    n = 0
+    for s in list(meta.get("scenes", [])):
+        for t in (store.get(f"tracklets:{s}") or []):
+            n += 1
+            for f in _FILTER_CAT_FIELDS:
+                v = t.get(f)
+                if v is not None and v != "":
+                    vals[f].add(str(v))
+    return {f: sorted(vs) for f, vs in vals.items()}, n
+
+
 class FilterTrajectories(foo.Operator):
     @property
     def config(self):
         return foo.OperatorConfig(
             name="filter_trajectories",
             label="Filter trajectories",
+            # Dynamic so each condition row's Value widget can be typed to the
+            # field the user picked (field-specific value suggestions).
+            dynamic=True,
             description=(
                 "Select built tracklets matching one or more conditions "
                 "(QC or scene/data mining). Writes a {scene: [track_idx]} "
@@ -599,8 +683,56 @@ class FilterTrajectories(foo.Operator):
             ),
         )
 
+    def _condition_object(self, field, field_values):
+        """Build one condition's nested Object, typed to the chosen field."""
+        field_choices = types.Dropdown()
+        for f in _FILTER_FIELDS:
+            field_choices.add_choice(f, label=_FIELD_LABELS.get(f, f))
+
+        obj = types.Object()
+        obj.enum(
+            "field", list(_FILTER_FIELDS), view=field_choices,
+            required=False, label="Field",
+        )
+        if field in _FILTER_CAT_FIELDS:
+            op_c = types.Choices()
+            for o in ("in", "not in", "==", "!="):
+                op_c.add_choice(o, label=o)
+            obj.enum("op", op_c.values(), default="in", view=op_c, label="Op")
+            vac = types.AutocompleteView(allow_user_input=True)
+            for v in field_values.get(field, []):
+                vac.add_choice(v, label=v)
+            obj.str(
+                "value", view=vac, label="Value",
+                description="Pick a value (or comma-list for in / not in).",
+            )
+        elif field in _FILTER_NUM_FIELDS:
+            op_c = types.Choices()
+            for o in ("<", "<=", ">", ">=", "==", "!="):
+                op_c.add_choice(o, label=o)
+            obj.enum("op", op_c.values(), default=">", view=op_c, label="Op")
+            obj.str("value", label="Value", description="A number.")
+        elif field in _FILTER_BOOL_FIELDS:
+            yn = types.RadioGroup(orientation="horizontal")
+            yn.add_choice("true", label="Yes")
+            yn.add_choice("false", label="No")
+            obj.enum("value", yn.values(), default="true", view=yn, label="Value")
+        # else: no field chosen yet → only the Field dropdown is shown.
+        return obj
+
     def resolve_input(self, ctx):
         inputs = types.Object()
+        field_values, n = _field_values(ctx)
+
+        if not n:
+            inputs.message(
+                "empty", label="Build trajectories first",
+                description="No tracklets are in the store yet.",
+            )
+            return types.Property(
+                inputs, view=types.View(label="Filter trajectories")
+            )
+
         combinator = types.Choices()
         combinator.add_choice("all", label="Match ALL conditions (AND)")
         combinator.add_choice("any", label="Match ANY condition (OR)")
@@ -608,22 +740,26 @@ class FilterTrajectories(foo.Operator):
             "combinator", combinator.values(), default="all", view=combinator,
             label="Combine", required=True,
         )
-        condition = types.Object()
-        condition.enum(
-            "field", list(_FILTER_FIELDS), required=True, label="Field",
-        )
-        condition.enum(
-            "op", list(_FILTER_OPS), default=">", required=True, label="Op",
-        )
-        condition.str(
-            "value", required=True, label="Value",
-            description="Number, string, true/false, or comma-list for in/not in "
-                        "(e.g. back_left,back_right).",
-        )
-        inputs.list(
-            "conditions", condition, label="Conditions",
-            description="Each row is a field/op/value test over tracklet scalars.",
-        )
+
+        # Render one row per filled condition + a trailing blank "add" row.
+        # dynamic=True re-runs this as the user picks a field, so each row's
+        # Value widget is typed to that field (categorical → dropdown of THAT
+        # field's values; numeric → number; boolean → Yes/No).
+        n_filled = 0
+        while True:
+            c = ctx.params.get(f"condition_{n_filled}")
+            if not (isinstance(c, dict) and c.get("field")):
+                break
+            n_filled += 1
+
+        for i in range(n_filled + 1):
+            cur = ctx.params.get(f"condition_{i}") or {}
+            obj = self._condition_object(cur.get("field"), field_values)
+            label = ("Condition " + str(i + 1)) if i < n_filled else "Add condition"
+            inputs.define_property(
+                f"condition_{i}", obj, view=types.View(label=label),
+            )
+
         inputs.str(
             "save_as", required=False, label="Save filter as",
             description="Optional: save these conditions under this name for "
@@ -635,7 +771,24 @@ class FilterTrajectories(foo.Operator):
         store = ctx.store(STORE_NAME)
         meta = store.get("meta") or {}
         scenes = list(meta.get("scenes", []))
-        conditions = ctx.params.get("conditions") or []
+
+        # Saved-filter replay / the "Apply filter" button pass a raw conditions
+        # list directly; the dynamic form passes condition_{i} blocks that we
+        # reconstruct into the same {field, op, value} shape.
+        raw = ctx.params.get("conditions")
+        if isinstance(raw, list):
+            conditions = raw
+        else:
+            conditions = []
+            i = 0
+            while isinstance(ctx.params.get(f"condition_{i}"), dict):
+                c = ctx.params[f"condition_{i}"]
+                field, value = c.get("field"), c.get("value")
+                if field and value not in (None, ""):
+                    conditions.append({
+                        "field": field, "op": c.get("op") or "==", "value": value,
+                    })
+                i += 1
         combinator = ctx.params.get("combinator") or "all"
 
         # No conditions → clear any active selection (show everything).
@@ -742,8 +895,38 @@ class DeleteTrajectoryFilter(foo.Operator):
 
     def execute(self, ctx) -> dict[str, Any]:
         name = ctx.params["name"]
-        deleted = _saved_filter_store().delete(_saved_filter_key(ctx, name))
+        try:
+            deleted = _saved_filter_store().delete(_saved_filter_key(ctx, name))
+        except Exception:
+            # Already gone / never existed — treat as a successful no-op
+            # rather than surfacing a "Failed to execute" toast.
+            deleted = False
         return {"deleted": bool(deleted), "name": name}
+
+
+class ClearTrajectoryFilter(foo.Operator):
+    """Clear the active trajectory-filter selection (show all tracklets).
+
+    A dedicated operator with no required inputs: the Trajectories tab's
+    "Clear filter" button can invoke it directly without the operator prompt,
+    avoiding the input-validation failure that ``filter_trajectories`` raised
+    when executed with no ``combinator``.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="clear_trajectory_filter",
+            label="Clear trajectory filter",
+            unlisted=True,
+        )
+
+    def execute(self, ctx) -> dict[str, Any]:
+        try:
+            ctx.store(STORE_NAME).delete("filter_selection")
+        except Exception:
+            pass
+        return {"cleared": True}
 
 
 # -----------------------------------------------------------------------------
@@ -1014,11 +1197,13 @@ class ViewTrackPatches(foo.Operator):
 
 def register(p):
     p.register(ListTrackingScenes)
+    p.register(ResolveSceneForSample)
     p.register(GetSceneTrackPayload)
     p.register(GetCameraFrameUrls)
     p.register(ViewTrackPatches)
     p.register(BuildTrajectories)
     p.register(GetTrajectories)
     p.register(FilterTrajectories)
+    p.register(ClearTrajectoryFilter)
     p.register(ListTrajectoryFilters)
     p.register(DeleteTrajectoryFilter)

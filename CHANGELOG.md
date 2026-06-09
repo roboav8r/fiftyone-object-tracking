@@ -15,6 +15,25 @@ once it leaves `0.x`.
   name in saved workspaces). The **Scene** tab is the previous per-scene
   BEV visualization; the new **Trajectories** tab builds, filters, and
   browses trajectories in-panel.
+- **Panel buttons recolored to Voxel51 brand orange** (`#FF6D04`),
+  replacing the placeholder blues on the toolbar buttons, the active-tab
+  underline, and the "View patches" button. The destructive delete-saved
+  (✕) button stays red.
+- **`filter_trajectories` is a dynamic, field-typed condition builder.** You
+  add conditions one at a time; once you pick a Field, its Value widget is
+  typed to that field — a dropdown of **that field's** real values for
+  categorical fields (so `Class` offers Cyclist/Car…, `Kind` offers
+  object/ego), a number box for numerics, and Yes/No for booleans. A blank
+  row appears to add the next condition. Fields show friendly labels
+  (`tracking_name`→"Class", `kind`→"Kind (object/ego)"). The stored condition
+  spec is unchanged, so saved filters still replay.
+- **Saved filters now apply on an explicit "Apply filter" button** rather
+  than auto-running when picked from the dropdown.
+- **Modal view infers its scene from the open sample.** On the modal
+  surface the scene dropdown is hidden; the panel resolves the open sample's
+  scene via a `resolve_scene_for_sample` server lookup (matching `_id` or
+  `group._id` across slices, so it works whether the modal is showing the
+  lidar or a camera slice) and auto-selects it (re-inferring as you navigate).
 - **Trajectories are now ephemeral — no trajectories dataset is created.**
   `build_trajectories` no longer materializes a per-trajectory FiftyOne
   dataset; it extracts tracklets (scalars + per-frame XY) into a
@@ -33,8 +52,39 @@ once it leaves `0.x`.
 - **Per-user saveable filters** — `filter_trajectories` can `save_as` a
   named spec in a global store keyed by user; `list_trajectory_filters` /
   `delete_trajectory_filter` back the tab's saved-filters dropdown.
+- **Ego / World frame toggle on the Trajectories grid.** Mini-BEV
+  thumbnails can plot either the ego-relative (base-frame) path or the
+  absolute world-frame path; in world frame the ego-origin marker and the
+  force-include-origin framing are dropped (the origin isn't meaningful).
+- **`clear_trajectory_filter`** (unlisted) — clears the active filter
+  selection with no required inputs (see Fixed).
+- **Scrubber syncs to FiftyOne's native modal timeline.** Instead of custom
+  playback controls, the Scene-tab scrubber follows the modal's native
+  timeline (`@fiftyone/playback`): native play/loop/speed advance the scrubber
+  and BEV markers, and dragging the scrubber seeks the native looker while
+  playback continues. Falls back to `open_sample` seeking when no native
+  timeline is present.
 
 ### Fixed
+
+- **Modal-surface detection fixed (`@fiftyone/spaces` PanelContext scope).**
+  The panel relied on an `isModalPanel` prop that FiftyOne no longer passes to
+  plugin components, so every modal-only behavior silently no-op'd on the modal
+  surface (scene dropdown wasn't hidden, scene wasn't inferred, the scrubber
+  didn't drive the looker). It now reads `usePanelContext().scope === "modal"`,
+  which re-activates scene inference, the dropdown hide, and timeline sync.
+
+- **"Clear filter" no longer throws "Failed to execute an operation."**
+  The button executed `filter_trajectories` with no `combinator`, which
+  failed input validation outside the operator prompt. Clearing now uses a
+  dedicated `clear_trajectory_filter` operator that just deletes the
+  selection; `delete_trajectory_filter` also tolerates a missing key.
+- **Scene scrubber drives the modal looker.** When no native timeline is
+  present, scrubbing in **modal** view jumps the open looker to the scrubbed
+  frame's grouped sample via the built-in `open_sample` operator (group-slice
+  aware through `useSetExpandedSample`); with a native timeline it seeks that
+  instead (see Added). Previously this never ran because modal-surface
+  detection was broken (see above).
 
 - **BEV panel camera-mirror thumbnail now renders local media.** The
   inline thumbnail loaded cloud (gs:///s3://) frames but showed a broken

@@ -11,11 +11,13 @@ panels:
   - ObjectTracking
 operators:
   - list_tracking_scenes
+  - resolve_scene_for_sample
   - get_scene_track_payload
   - get_camera_frame_urls
   - view_track_patches
   - build_trajectories
   - get_trajectories
   - filter_trajectories
+  - clear_trajectory_filter
   - list_trajectory_filters
   - delete_trajectory_filter

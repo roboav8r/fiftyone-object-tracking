@@ -24,6 +24,8 @@
   var fos    = window.__fos__ || window.fos;
   var foo    = window.__foo__ || window.foo;
   var fop    = window.__fop__ || window.fop;
+  var fosp   = window.__fosp__ || window.fosp || {};   // @fiftyone/spaces
+  var fopb   = window.__fopb__ || window.fopb || {};   // @fiftyone/playback
   var mui    = window.__mui__ || window.mui || {};
 
   if (!React || !fop) {
@@ -681,7 +683,7 @@
       title: atDefault ? "View at default" : "Reset pan/zoom",
       style: {
         position: "absolute", top: 8, right: 8,
-        background: atDefault ? "#222" : "#2a4a6a",
+        background: atDefault ? "#222" : V51_ORANGE,
         color: "#eee", border: "1px solid #444", borderRadius: 4,
         padding: "3px 8px", cursor: "pointer",
         fontFamily: "ui-monospace, monospace", fontSize: 11,
@@ -946,8 +948,12 @@
   // and an in-panel SVG grid of the resulting tracklets. For now it is an
   // inert placeholder so the tab shell can be wired and verified.
   // ---------------------------------------------------------------------------
+  // Voxel51 brand primary (design-system tokens aren't importable from a
+  // standalone UMD plugin, so the canonical hex is inlined here).
+  var V51_ORANGE = "#FF6D04";
+
   var BTN_STYLE = {
-    background: "#2a4a6a", color: "#eee", border: "1px solid #444",
+    background: V51_ORANGE, color: "#fff", border: "1px solid #444",
     borderRadius: 4, padding: "5px 10px", cursor: "pointer",
     fontFamily: "ui-sans-serif, system-ui", fontSize: 12,
   };
@@ -962,10 +968,15 @@
   function TrajectoryThumb(props) {
     var t = props.tracklet;
     var size = props.size || 132;
-    // Ego sits at its base-frame origin, so plot its scene-local path;
-    // objects plot their base-frame path relative to the ego at origin.
-    var xy = (t.kind === "ego" && t.xy_scene_local && t.xy_scene_local.length)
-      ? t.xy_scene_local : (t.xy_base || []);
+    var isWorld = props.frame === "world";
+    // World frame: plot the absolute world-frame path (ego origin is not
+    // meaningful). Ego/base frame: ego sits at its base-frame origin so plot
+    // its scene-local path; objects plot their base-frame path relative to
+    // the ego at origin.
+    var xy = isWorld
+      ? (t.xy_world || [])
+      : ((t.kind === "ego" && t.xy_scene_local && t.xy_scene_local.length)
+          ? t.xy_scene_local : (t.xy_base || []));
 
     var xs = [], ys = [];
     for (var i = 0; i < xy.length; i++) {
@@ -979,8 +990,9 @@
 
     var xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
     var yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
-    // Objects: force-include the ego origin so the path reads relative to it.
-    if (t.kind !== "ego") {
+    // Objects (ego/base frame only): force-include the ego origin so the path
+    // reads relative to it. In world frame the origin carries no meaning.
+    if (t.kind !== "ego" && !isWorld) {
       xMin = Math.min(xMin, 0); xMax = Math.max(xMax, 0);
       yMin = Math.min(yMin, 0); yMax = Math.max(yMax, 0);
     }
@@ -1010,7 +1022,7 @@
                     stroke: color, strokeWidth: 1.4 }),
       h("circle", { key: "end", cx: pN[0], cy: pN[1], r: 2.4, fill: color }),
     ];
-    if (t.kind !== "ego") {
+    if (t.kind !== "ego" && !isWorld) {
       kids.push(h("circle", { key: "ego", cx: origin[0], cy: origin[1], r: 2.6,
                               fill: "#2bff7f", stroke: "#0a0a0a",
                               strokeWidth: 0.7 }));
@@ -1026,6 +1038,7 @@
     var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
     var filterOp = foo.useOperatorExecutor(OP("filter_trajectories"));
+    var clearFilterOp = foo.useOperatorExecutor(OP("clear_trajectory_filter"));
     var listFiltersOp = foo.useOperatorExecutor(OP("list_trajectory_filters"));
     var deleteFilterOp = foo.useOperatorExecutor(OP("delete_trajectory_filter"));
     var promptInput = foo.usePromptOperatorInput();
@@ -1038,6 +1051,7 @@
     var [polling, setPolling] = useState(false);
     var [savedFilters, setSavedFilters] = useState([]);
     var [selectedSaved, setSelectedSaved] = useState("");
+    var [trajFrame, setTrajFrame] = useState("base");  // "base" (ego) | "world"
 
     // Fire get_trajectories on scene change / explicit refresh.
     useEffect(function () {
@@ -1107,6 +1121,24 @@
               : (rows.length + " trajectories"
                  + (meta && meta.scenes ? " · " + meta.scenes.length + " scene(s)" : ""))));
 
+    function frameBtn(mode, label) {
+      var active = trajFrame === mode;
+      return h("button", {
+        key: "frame-" + mode,
+        onClick: function () { setTrajFrame(mode); },
+        title: mode === "world"
+          ? "Plot absolute world-frame paths"
+          : "Plot ego-relative (base-frame) paths",
+        style: {
+          background: active ? V51_ORANGE : "transparent",
+          color: active ? "#fff" : "#aaa",
+          border: "1px solid " + (active ? V51_ORANGE : "#444"),
+          borderRadius: 4, padding: "4px 8px", cursor: "pointer",
+          fontFamily: "ui-sans-serif, system-ui", fontSize: 11,
+        },
+      }, label);
+    }
+
     var toolbar = h("div", {
       key: "traj-toolbar",
       style: { display: "flex", gap: 8, padding: "8px 12px",
@@ -1144,7 +1176,7 @@
             key: "clear", style: BTN_STYLE, title: "Clear the active filter",
             onClick: function () {
               try {
-                filterOp.execute({ conditions: [] });
+                clearFilterOp.execute({});
                 setPolling(true);
               } catch (e) { console.error("[obj-track] clear filter throw", e); }
             },
@@ -1154,6 +1186,12 @@
         key: "refresh", style: BTN_STYLE, title: "Reload from the store",
         onClick: function () { setRefreshTick(function (x) { return x + 1; }); },
       }, "↻"),
+      h("span", { key: "frame-toggle", style: { display: "flex", gap: 4,
+                   alignItems: "center", marginLeft: 4 } }, [
+        h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
+                     fontFamily: "ui-sans-serif, system-ui" } }, "Frame:"),
+        frameBtn("base", "Ego"), frameBtn("world", "World"),
+      ]),
       h("span", { key: "status", style: { marginLeft: 8, fontSize: 12,
                    color: "#aaa", fontFamily: "ui-sans-serif, system-ui" } },
         status + (polling ? " · building…" : "")),
@@ -1165,12 +1203,29 @@
           key: "saved-sel", value: selectedSaved,
           style: { background: "#222", color: "#eee", border: "1px solid #444" },
           onChange: function (e) {
-            var name = e.target.value;
-            setSelectedSaved(name);
-            if (!name) return;
+            // Selecting a saved filter no longer auto-applies it; the user
+            // clicks "Apply filter" to run it (explicit, predictable).
+            setSelectedSaved(e.target.value);
+          },
+        }, [h("option", { key: "_none", value: "" }, "(none)")].concat(
+          savedFilters.map(function (f) {
+            return h("option", { key: f.name, value: f.name }, f.name);
+          })
+        )),
+        h("button", {
+          key: "apply-saved",
+          style: selectedSaved ? BTN_STYLE : BTN_DISABLED,
+          disabled: !selectedSaved,
+          title: selectedSaved
+            ? "Apply the selected saved filter to the grid"
+            : "Pick a saved filter first",
+          onClick: function () {
+            if (!selectedSaved) return;
             var spec = null;
             for (var i = 0; i < savedFilters.length; i++) {
-              if (savedFilters[i].name === name) { spec = savedFilters[i]; break; }
+              if (savedFilters[i].name === selectedSaved) {
+                spec = savedFilters[i]; break;
+              }
             }
             if (!spec) return;
             try {
@@ -1179,11 +1234,7 @@
               setPolling(true);
             } catch (err) { console.error("[obj-track] apply saved throw", err); }
           },
-        }, [h("option", { key: "_none", value: "" }, "(none)")].concat(
-          savedFilters.map(function (f) {
-            return h("option", { key: f.name, value: f.name }, f.name);
-          })
-        )),
+        }, "Apply filter"),
         selectedSaved
           ? h("button", {
               key: "del-saved",
@@ -1213,7 +1264,8 @@
           display: "flex", flexDirection: "column", gap: 4, width: 148,
         },
       }, [
-        h(TrajectoryThumb, { key: "thumb", tracklet: t, size: 130 }),
+        h(TrajectoryThumb, { key: "thumb", tracklet: t, size: 130,
+                             frame: trajFrame }),
         h("div", { key: "lbl", style: { fontSize: 11, color: "#eee",
                     fontFamily: "ui-sans-serif, system-ui",
                     whiteSpace: "nowrap", overflow: "hidden",
@@ -1244,17 +1296,83 @@
 
 
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // ModalTimelineSync — bridge to FiftyOne's native modal timeline.
+  // Rendered (and its playback hooks therefore only called) on the modal
+  // surface. Maps the native 1-based ordinal frame to this scene's frame_idx
+  // to drive the panel, and exposes a seek fn (frame_idx → timeline %) so the
+  // scrubber can move the native looker. Renders nothing.
+  // ---------------------------------------------------------------------------
+  function ModalTimelineSync(props) {
+    var frameIndices = props.frameIndices || [];
+    var onFrame = props.onFrame;
+    var seekRef = props.seekRef;
+
+    var name = "";
+    try {
+      name = fopb.useDefaultTimelineNameImperative
+        ? fopb.useDefaultTimelineNameImperative().getName()
+        : "";
+    } catch (e) { /* no timeline context */ }
+
+    var frameNumber = null;
+    try {
+      frameNumber = fopb.useFrameNumber ? fopb.useFrameNumber(name) : null;
+    } catch (e) { /* not initialized */ }
+
+    var viz = null;
+    try {
+      viz = fopb.useTimelineVizUtils ? fopb.useTimelineVizUtils(name) : null;
+    } catch (e) { /* not initialized */ }
+
+    // Native frame (1-based ordinal) → this scene's frame_idx → drive panel.
+    useEffect(function () {
+      if (frameNumber == null || !frameIndices.length) return;
+      var pos = Math.max(0, Math.min(frameIndices.length - 1, frameNumber - 1));
+      if (onFrame) onFrame(frameIndices[pos]);
+    }, [frameNumber, frameIndices.length]);
+
+    // Expose seek: frame_idx → ordinal % → seekTo (moves looker + native frame).
+    useEffect(function () {
+      if (!seekRef) return;
+      seekRef.current = (viz && typeof viz.seekTo === "function")
+        ? function (frameIdx) {
+            var pos = frameIndices.indexOf(frameIdx);
+            if (pos < 0) return;
+            var len = frameIndices.length;
+            viz.seekTo(len > 1 ? (pos / (len - 1)) * 100 : 0);
+          }
+        : null;
+      return function () { if (seekRef) seekRef.current = null; };
+    }, [viz, frameIndices]);
+
+    return null;
+  }
+
+
+  // ---------------------------------------------------------------------------
   // Main panel
   // ---------------------------------------------------------------------------
   function BEVPanel(props) {
     var listScenesOp = foo.useOperatorExecutor(OP("list_tracking_scenes"));
+    var resolveSceneOp = foo.useOperatorExecutor(OP("resolve_scene_for_sample"));
     var getPayloadOp = foo.useOperatorExecutor(OP("get_scene_track_payload"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
     var getCamUrlsOp = foo.useOperatorExecutor(OP("get_camera_frame_urls"));
+    // Built-in operator: drives the modal looker to a given sample. Routes
+    // through useSetExpandedSample, which resolves the correct group slice
+    // for grouped datasets (unlike a raw modal-atom write).
+    var openSampleOp = foo.useOperatorExecutor("@voxel51/operators/open_sample");
 
-    // FOE plugin SDK injects isModalPanel + dimensions on the panel props.
-    // Default to grid behavior if the prop is missing.
-    var isModal = !!(props && props.isModalPanel);
+    // Surface detection. The `isModalPanel` prop is NOT passed to plugin
+    // components by FiftyOne's Panel wrapper — the reliable signal is the
+    // @fiftyone/spaces PanelContext scope ("modal" | "grid"), which Panel.tsx
+    // always sets. Fall back to the prop if the hook is unavailable.
+    var panelScope = null;
+    try {
+      panelScope = (fosp.usePanelContext && fosp.usePanelContext() || {}).scope;
+    } catch (e) { /* spaces hook unavailable on this FOE version */ }
+    var isModal = panelScope === "modal" || !!(props && props.isModalPanel);
     var bounds = (props && props.dimensions && props.dimensions.bounds) || {};
 
     // One-time log so we know which surface a given mount is on.
@@ -1281,6 +1399,9 @@
     var [activeTab, setActiveTab] = useState("scene");   // "scene" | "trajectories"
     var [viewMode, setViewMode] = useState("base");      // "base" | "world"
     var [scrubFrameIdx, setScrubFrameIdx] = useState(null);
+    // Seek fn into FiftyOne's native modal timeline, populated by the modal-only
+    // ModalTimelineSync child when a native timeline is present.
+    var timelineSeekRef = useRef(null);
     var [hoveredInstanceId, setHoveredInstanceId] = useState(null);
     // Set of FO instance hexes the user has selected on the BEV
     // panel. Plain click → set-of-one (replace); Ctrl/Cmd/Shift-click
@@ -1343,18 +1464,13 @@
     try { setSelectedSamples = recoil.useSetRecoilState(fos.selectedSamples); }
     catch (e) { /* atom not exported */ }
 
-    // FO 2.18 split the modal atom into multiple granular atoms
-    // (currentModalSlice, modalGroupSlice, currentModalUniqueIdJotaiAtom,
-    // useExpandSample, ...). The single-string-ID setter pattern that
-    // worked in earlier versions now triggers a GraphQL failure because
-    // the partial atom shape can't be resolved into a full modal state
-    // (missing group + slice context). Rather than chase the right
-    // multi-atom write sequence per FO version, the plugin treats modal
-    // sync as App → panel only: opening the modal yourself + scrubbing
-    // the panel updates the panel's BEV state, but the modal looker
-    // does NOT auto-jump on scrub. For a per-frame camera view, see
-    // the inline camera-mirror thumbnail (option-C).
-    var setModalSample = null;
+    // FO 2.18 split the modal atom into multiple granular atoms, so the old
+    // single-string-ID setter triggered a GraphQL failure (partial atom shape
+    // can't resolve group + slice context). Instead of poking atoms directly,
+    // commitJump drives the modal through the built-in `open_sample` operator
+    // (openSampleOp), which routes through useSetExpandedSample and resolves
+    // the group slice for grouped datasets — so scrubbing the panel now jumps
+    // the modal looker to the scrubbed frame's group.
 
     // ---- Operator-call pattern. FOE's useOperatorExecutor uses fire-and-
     //      forget .execute() + a polled .result property; .then() chains do
@@ -1377,10 +1493,33 @@
         return;
       }
       setSceneInfo(out);
-      if (out && out.scenes && out.scenes.length && !selectedScene) {
+      // Grid: default to the first scene. Modal: leave it for the inference
+      // effect below to pick the scene that contains the open sample.
+      if (!isModal && out && out.scenes && out.scenes.length && !selectedScene) {
         setSelectedScene(out.scenes[0].scene_name);
       }
     }, [listScenesOp.result]);
+
+    // Modal: infer the scene from the open sample via a server lookup (the
+    // modal has no scene dropdown). The modal's active id can be ANY slice's
+    // sample (e.g. a camera) or the group id, so resolve it server-side rather
+    // than guessing client-side. Re-runs as the modal navigates.
+    useEffect(function () {
+      if (!isModal || !modalSampleId) return;
+      try { resolveSceneOp.execute({ sample_id: modalSampleId }); }
+      catch (e) { console.error("[bev-panel] resolve_scene_for_sample throw", e); }
+    }, [isModal, modalSampleId]);
+
+    var lastResolvedSceneRef = useRef(null);
+    useEffect(function () {
+      var r = resolveSceneOp.result;
+      if (!r || r === lastResolvedSceneRef.current) return;
+      lastResolvedSceneRef.current = r;
+      var out = r.result || r;
+      if (out && out.scene_name && out.scene_name !== selectedScene) {
+        setSelectedScene(out.scene_name);
+      }
+    }, [resolveSceneOp.result]);
 
     // Fire get_scene_track_payload when scene changes (deduped).
     var lastPayloadKeyRef = useRef(null);
@@ -1435,9 +1574,23 @@
       });
     }, [getCamUrlsOp.result]);
 
-    // Consume get_scene_track_payload result.
+    // Consume get_scene_track_payload result. Also surface executor-level
+    // errors (the operator throwing server-side) by caching an error payload
+    // so the chart shows the reason instead of hanging on "Loading scene…".
     var lastConsumedPayloadRef = useRef(null);
     useEffect(function () {
+      if (getPayloadOp.error && selectedScene) {
+        console.error("[bev-panel] get_scene_track_payload executor error ("
+          + (isModal ? "modal" : "grid") + "):", getPayloadOp.error);
+        var es = selectedScene;
+        setPayloadCache(function (prev) {
+          if (prev[es]) return prev;
+          var next = Object.assign({}, prev);
+          next[es] = { scene_name: es, error: String(getPayloadOp.error) };
+          return next;
+        });
+        return;
+      }
       var result = getPayloadOp.result;
       if (!result || result === lastConsumedPayloadRef.current) return;
       lastConsumedPayloadRef.current = result;
@@ -1454,7 +1607,7 @@
       if (scrubFrameIdx === null && out.frame_indices && out.frame_indices.length) {
         setScrubFrameIdx(out.frame_indices[0]);
       }
-    }, [getPayloadOp.result]);
+    }, [getPayloadOp.result, getPayloadOp.error]);
 
     var payload = payloadCache[selectedScene || ""] || null;
 
@@ -1497,19 +1650,32 @@
       if (!sid || sid === lastCommitted.current) return;
       lastCommitted.current = sid;
 
-      // Grid mode: highlight the lidar sample at this frame so the user
-      // can double-click into the modal manually. Modal mode: no-op
-      // (FO 2.18 modal atom too fragile to write from a plugin; see the
-      // "setModalSample = null" comment block above).
+      // Grid mode: highlight the lidar sample at this frame so the user can
+      // double-click into the modal manually. Modal mode: navigate the open
+      // modal to this frame's group via the built-in open_sample operator
+      // (mirrors a grid click on the lidar sample; group-slice aware).
       if (!isModal && setSelectedSamples) {
         setSelectedSamples(new Set([sid]));
+      } else if (isModal) {
+        try { openSampleOp.execute({ id: sid }); }
+        catch (e) { console.error("[bev-panel] open_sample throw", e); }
       }
-    }, [payload, isModal, setSelectedSamples]);
+    }, [payload, isModal, setSelectedSamples, openSampleOp]);
 
-    function onScrub(frameIdx) { setScrubFrameIdx(frameIdx); }
+    // Scrub handlers. In modal with a native timeline present, seek it (the
+    // looker + our scrubber both follow, and native play/loop/speed continue).
+    // Otherwise fall back to commitJump (grid highlight / modal open_sample).
+    function onScrub(frameIdx) {
+      setScrubFrameIdx(frameIdx);
+      if (isModal && timelineSeekRef.current) timelineSeekRef.current(frameIdx);
+    }
     function onCommit(frameIdx) {
       setScrubFrameIdx(frameIdx);
-      commitJump(frameIdx);
+      if (isModal && timelineSeekRef.current) {
+        timelineSeekRef.current(frameIdx);
+      } else {
+        commitJump(frameIdx);
+      }
     }
 
     // ---- Header ----
@@ -1523,8 +1689,11 @@
     }, [
       h("strong", { key: "ttl" }, "Scene"),
 
-      sceneOptions.length > 1
-        ? h("label", { key: "scene-pick" }, [
+      // Modal infers its scene from the open sample → static label, no picker.
+      (isModal || sceneOptions.length <= 1)
+        ? h("span", { key: "scene-only" },
+            selectedScene ? "  Scene: " + selectedScene : "")
+        : h("label", { key: "scene-pick" }, [
             "  Scene: ",
             h("select", {
               key: "scene-sel",
@@ -1535,9 +1704,7 @@
               return h("option", { key: s.scene_name, value: s.scene_name },
                        s.scene_name + " (" + s.n_frames + ")");
             })),
-          ])
-        : h("span", { key: "scene-only" },
-            selectedScene ? "  Scene: " + selectedScene : ""),
+          ]),
 
       h("label", { key: "view-tog" }, [
         "View: ",
@@ -1611,7 +1778,7 @@
             + " across all camera slices, ordered by frame_idx",
         style: {
           background: (selectedInstanceIds && selectedInstanceIds.size > 0)
-            ? "#2a4a6a" : "#333",
+            ? V51_ORANGE : "#333",
           color: "#eee", border: "1px solid #444", borderRadius: 4,
           padding: "4px 8px",
           cursor: (selectedInstanceIds && selectedInstanceIds.size > 0)
@@ -1686,6 +1853,19 @@
         : null,
     ]);
 
+    // Modal: bridge to FiftyOne's native timeline (the modal's own play / loop /
+    // speed controls). Renders nothing — it follows the native frame to drive
+    // the scrubber + BEV, and populates timelineSeekRef so dragging the scrubber
+    // seeks the native looker. No custom transport controls in the panel.
+    var timelineSync = isModal
+      ? h(ModalTimelineSync, {
+          key: "tl-sync",
+          frameIndices: payload ? payload.frame_indices : [],
+          onFrame: setScrubFrameIdx,
+          seekRef: timelineSeekRef,
+        })
+      : null;
+
     var scrubberBlock = h("div", {
       style: { padding: "0 12px 6px" },
     }, h(Scrubber, {
@@ -1722,7 +1902,7 @@
           background: active ? "#1c1c1c" : "transparent",
           color: active ? "#fff" : "#aaa",
           border: "none",
-          borderBottom: active ? "2px solid #4a90d9" : "2px solid transparent",
+          borderBottom: active ? ("2px solid " + V51_ORANGE) : "2px solid transparent",
           padding: "8px 16px", cursor: "pointer",
           fontFamily: "ui-sans-serif, system-ui", fontSize: 13,
           fontWeight: active ? 600 : 400,
@@ -1737,7 +1917,8 @@
     }, [tabBtn("scene", "Scene"), tabBtn("trajectories", "Trajectories")]);
 
     var sceneTab = h("div", { key: "scene-tab" },
-                     [header, bevBlock, scrubberBlock, timelineBlock]);
+                     [header, bevBlock, timelineSync, scrubberBlock,
+                      timelineBlock]);
 
     return h("div", {
       style: {
