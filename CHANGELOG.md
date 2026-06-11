@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once it leaves `0.x`.
 
-## [Unreleased]
+## [0.3.0] — 2026-06-11
 
 ### Changed
 
@@ -149,4 +149,5 @@ Enterprise base image. No additional install step on the deployment.
 - FiftyOne Enterprise ≥ 2.18.0.
 - Admin permissions on the deployment to upload the plugin.
 
+[0.3.0]: https://github.com/roboav8r/fiftyone-object-tracking/releases/tag/v0.3.0
 [0.2.0]: https://github.com/roboav8r/fiftyone-object-tracking/releases/tag/v0.2.0
