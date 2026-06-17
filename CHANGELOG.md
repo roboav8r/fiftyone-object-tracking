@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once it leaves `0.x`.
 
+## [Unreleased]
+
+### Changed
+
+- **The Trajectories grid shows all built scenes by default.** Previously it
+  was scoped to the Scene tab's single selected scene, so "Build all scenes"
+  built every scene but the grid only ever showed one. The tab now has its own
+  **Scene** dropdown (`All scenes` + each built scene); `Select all` / filter /
+  tag / export act on the full set. The flat all-scenes grid is render-capped
+  (600 cells) with an explicit "Showing N of M" banner — no silent truncation —
+  and each cell shows its scene.
+- **Tags write through to every slice's detections, not just lidar.** Tagging a
+  trajectory now stamps the label tag on the matching `instance._id` across all
+  group slices that carry a `detections` field (lidar cuboids **and** the camera
+  2D boxes), so the tag shows wherever the track is viewed.
+- **Grid and saved-filters bar refresh automatically.** Mutating operators
+  (build, filter, apply/clear/delete saved filter, tag) now use the operator
+  completion `callback` (FiftyOne ≥2.18) instead of a fixed poll that started on
+  click — so a newly saved filter and the regrid appear without a manual refresh.
+
+### Added
+
+- **Tag & export selected trajectories.** The Trajectories grid is now
+  multi-selectable: **ctrl/⌘-click** toggles one trajectory, **shift-click**
+  range-selects from the last-clicked anchor, and a **Select all** button
+  selects every shown object trajectory. A plain click still opens that
+  track's patches. A selection toolbar shows the count and exposes the new
+  actions.
+- **`tag_trajectories`** (unlisted) — add/remove free-form tags on the
+  selected trajectories. Tags are **written through to the underlying
+  detection label tags** (every `Detection` sharing the trajectory's
+  `instance._id` on the lidar slice), so they are durable, filterable in the
+  App sidebar, and re-hydrated onto the tracklets on the next
+  `build_trajectories`. The in-store tracklets are updated in place so the
+  grid reflects tags immediately (shown as chips on each cell).
+- **`export_trajectories`** (unlisted) — download the selected trajectories
+  as a JSON file (browser download via a base64 `data:` URL, so it works on
+  remote deployments). The document is `{scene_name: [record, …]}` where each
+  record carries identifiers (`scene_name`, `tracking_id`, `instance_id`,
+  `tracking_name`, `track_idx`), the scalar metadata, the `tags`, and the
+  per-frame `xy_base`/`xy_world` paths. Intended for an offline pass that
+  flags specific `tracking_id`/`instance_id`s for re-annotation.
+
 ## [0.3.0] — 2026-06-11
 
 ### Changed
