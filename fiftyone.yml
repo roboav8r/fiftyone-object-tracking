@@ -21,3 +21,5 @@ operators:
   - clear_trajectory_filter
   - list_trajectory_filters
   - delete_trajectory_filter
+  - tag_trajectories
+  - export_trajectories

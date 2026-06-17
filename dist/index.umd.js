@@ -1034,13 +1034,14 @@
   // Trajectories tab — build ephemeral tracklets and browse them as a grid.
   // ---------------------------------------------------------------------------
   function TrajectoriesTab(props) {
-    var selectedScene = props.selectedScene;
     var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
     var viewPatchesOp = foo.useOperatorExecutor(OP("view_track_patches"));
     var filterOp = foo.useOperatorExecutor(OP("filter_trajectories"));
     var clearFilterOp = foo.useOperatorExecutor(OP("clear_trajectory_filter"));
     var listFiltersOp = foo.useOperatorExecutor(OP("list_trajectory_filters"));
     var deleteFilterOp = foo.useOperatorExecutor(OP("delete_trajectory_filter"));
+    var tagTrajOp = foo.useOperatorExecutor(OP("tag_trajectories"));
+    var exportTrajOp = foo.useOperatorExecutor(OP("export_trajectories"));
     var promptInput = foo.usePromptOperatorInput();
 
     var [rows, setRows] = useState([]);
@@ -1048,16 +1049,30 @@
     var [filterInfo, setFilterInfo] = useState(null);
     var [loaded, setLoaded] = useState(false);
     var [refreshTick, setRefreshTick] = useState(0);
-    var [polling, setPolling] = useState(false);
     var [savedFilters, setSavedFilters] = useState([]);
     var [selectedSaved, setSelectedSaved] = useState("");
     var [trajFrame, setTrajFrame] = useState("base");  // "base" (ego) | "world"
+    // Which scene(s) the grid shows; "__all__" = every built scene.
+    var [trajScene, setTrajScene] = useState("__all__");
+    // Multi-select for tag/export: a Set of "scene:track_idx" keys.
+    // ctrl/cmd-click toggles one; shift-click range-selects from the
+    // last-clicked anchor; plain click still opens the track's patches.
+    var [selected, setSelected] = useState(function () { return new Set(); });
+    var [tagText, setTagText] = useState("");
+    var anchorRef = useRef(null);
+
+    // Refresh helper: bumping refreshTick re-runs get_trajectories AND
+    // list_trajectory_filters. Passed as the completion callback to every
+    // mutating operator below, so the grid + saved-filters bar update as
+    // soon as the operator finishes — no polling, no manual refresh.
+    function bumpRefresh() { setRefreshTick(function (x) { return x + 1; }); }
 
     // Fire get_trajectories on scene change / explicit refresh.
     useEffect(function () {
-      try { getTrajOp.execute({ scene_name: selectedScene || null }); }
+      var sc = trajScene === "__all__" ? null : trajScene;
+      try { getTrajOp.execute({ scene_name: sc }); }
       catch (e) { console.error("[obj-track] get_trajectories throw", e); }
-    }, [selectedScene, refreshTick]);
+    }, [trajScene, refreshTick]);
 
     // Consume get_trajectories result.
     var lastConsumed = useRef(null);
@@ -1087,19 +1102,6 @@
       setSavedFilters((out && out.filters) || []);
     }, [listFiltersOp.result]);
 
-    // After a Build, poll briefly until the store's data lands (the 2.16
-    // operator prompt doesn't expose a success callback).
-    useEffect(function () {
-      if (!polling) return;
-      var n = 0;
-      var iv = setInterval(function () {
-        n += 1;
-        setRefreshTick(function (x) { return x + 1; });
-        if (n >= 10) { clearInterval(iv); setPolling(false); }
-      }, 1500);
-      return function () { clearInterval(iv); };
-    }, [polling]);
-
     function openCellPatches(t) {
       if (t.kind === "ego" || !t.scene_name) return;  // ego has no detections
       try {
@@ -1112,6 +1114,78 @@
     // Filter selection (Stage 3): when active, show only matched tracklets.
     var filterActive = !!(filterInfo && filterInfo.active);
     var shown = filterActive ? rows.filter(function (t) { return t._matched; }) : rows;
+
+    // ----- multi-selection (tag / export) -----
+    function selKey(t) { return (t.scene_name || "") + ":" + t.track_idx; }
+
+    function onCellClick(t, idx, e) {
+      var shift = e && e.shiftKey;
+      var ctrl = e && (e.ctrlKey || e.metaKey);
+      if (shift && anchorRef.current != null) {
+        var a = Math.min(anchorRef.current, idx);
+        var b = Math.max(anchorRef.current, idx);
+        setSelected(function (prev) {
+          var next = new Set(prev);
+          for (var i = a; i <= b; i++) {
+            var tt = shown[i];
+            if (tt && tt.kind !== "ego") next.add(selKey(tt));
+          }
+          return next;
+        });
+        return;
+      }
+      if (ctrl) {
+        anchorRef.current = idx;
+        setSelected(function (prev) {
+          var next = new Set(prev);
+          var k = selKey(t);
+          if (next.has(k)) next.delete(k);
+          else if (t.kind !== "ego") next.add(k);
+          return next;
+        });
+        return;
+      }
+      anchorRef.current = idx;
+      openCellPatches(t);  // plain click preserves the patches behavior
+    }
+
+    function selectAllShown() {
+      setSelected(function () {
+        var next = new Set();
+        shown.forEach(function (t) {
+          if (t.kind !== "ego") next.add(selKey(t));
+        });
+        return next;
+      });
+    }
+    function clearSelection() { setSelected(new Set()); }
+
+    // Resolve the selected keys back to {scene_name, instance_id, track_idx}
+    // for the tag/export operators (from rows so selection survives filtering).
+    var selItems = rows.filter(function (r) {
+      return r.kind !== "ego" && selected.has(selKey(r));
+    }).map(function (r) {
+      return { scene_name: r.scene_name, instance_id: r.instance_id,
+               track_idx: r.track_idx };
+    });
+    var nSel = selItems.length;
+
+    function applyTags(mode) {
+      var tags = tagText.split(",").map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length; });
+      if (!tags.length || nSel === 0) return;
+      try {
+        tagTrajOp.execute({ selection: selItems, tags: tags, mode: mode },
+                          { callback: bumpRefresh });
+      } catch (e) { console.error("[obj-track] tag_trajectories throw", e); }
+    }
+
+    function exportSelected() {
+      if (nSel === 0) return;
+      try {
+        exportTrajOp.execute({ selection: selItems, include_xy: true });
+      } catch (e) { console.error("[obj-track] export_trajectories throw", e); }
+    }
 
     var status = !loaded ? "Loading…"
       : (rows.length === 0
@@ -1151,8 +1225,8 @@
         onClick: function () {
           try {
             promptInput(OP("build_trajectories"),
-                        { scene: selectedScene || "__all__" });
-            setPolling(true);
+                        { scene: trajScene || "__all__" },
+                        { callback: bumpRefresh });
           } catch (e) { console.error("[obj-track] prompt build throw", e); }
         },
       }, "Build trajectories"),
@@ -1166,8 +1240,7 @@
         onClick: function () {
           if (rows.length === 0) return;
           try {
-            promptInput(OP("filter_trajectories"), {});
-            setPolling(true);
+            promptInput(OP("filter_trajectories"), {}, { callback: bumpRefresh });
           } catch (e) { console.error("[obj-track] prompt filter throw", e); }
         },
       }, "Filter trajectories"),
@@ -1176,8 +1249,7 @@
             key: "clear", style: BTN_STYLE, title: "Clear the active filter",
             onClick: function () {
               try {
-                clearFilterOp.execute({});
-                setPolling(true);
+                clearFilterOp.execute({}, { callback: bumpRefresh });
               } catch (e) { console.error("[obj-track] clear filter throw", e); }
             },
           }, "Clear filter")
@@ -1186,6 +1258,22 @@
         key: "refresh", style: BTN_STYLE, title: "Reload from the store",
         onClick: function () { setRefreshTick(function (x) { return x + 1; }); },
       }, "↻"),
+      h("label", { key: "scene-pick", style: { display: "flex", gap: 4,
+                   alignItems: "center", marginLeft: 4, fontSize: 11,
+                   color: "#888", fontFamily: "ui-sans-serif, system-ui" } }, [
+        "Scene:",
+        h("select", {
+          key: "scene-sel", value: trajScene,
+          style: { background: "#222", color: "#eee", border: "1px solid #444",
+                   borderRadius: 4, fontSize: 11, maxWidth: 220 },
+          title: "Which scene(s) the grid shows",
+          onChange: function (e) { setTrajScene(e.target.value); clearSelection(); },
+        }, [h("option", { key: "__all__", value: "__all__" }, "All scenes")].concat(
+          (((meta && meta.scenes) || [])).map(function (s) {
+            return h("option", { key: s, value: s }, s);
+          })
+        )),
+      ]),
       h("span", { key: "frame-toggle", style: { display: "flex", gap: 4,
                    alignItems: "center", marginLeft: 4 } }, [
         h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
@@ -1194,7 +1282,7 @@
       ]),
       h("span", { key: "status", style: { marginLeft: 8, fontSize: 12,
                    color: "#aaa", fontFamily: "ui-sans-serif, system-ui" } },
-        status + (polling ? " · building…" : "")),
+        status + (getTrajOp.isExecuting ? " · working…" : "")),
       h("label", { key: "saved", style: { marginLeft: "auto", fontSize: 12,
                     color: "#ddd", fontFamily: "ui-sans-serif, system-ui",
                     display: "flex", alignItems: "center", gap: 6 } }, [
@@ -1230,8 +1318,8 @@
             if (!spec) return;
             try {
               filterOp.execute({ combinator: spec.combinator,
-                                 conditions: spec.conditions });
-              setPolling(true);
+                                 conditions: spec.conditions },
+                               { callback: bumpRefresh });
             } catch (err) { console.error("[obj-track] apply saved throw", err); }
           },
         }, "Apply filter"),
@@ -1242,28 +1330,103 @@
                        background: "#5a2a2a" }),
               title: "Delete this saved filter",
               onClick: function () {
-                try { deleteFilterOp.execute({ name: selectedSaved }); }
-                catch (err) { console.error("[obj-track] delete saved throw", err); }
+                try {
+                  deleteFilterOp.execute({ name: selectedSaved },
+                                         { callback: bumpRefresh });
+                } catch (err) { console.error("[obj-track] delete saved throw", err); }
                 setSelectedSaved("");
-                setRefreshTick(function (x) { return x + 1; });
               },
             }, "✕")
           : null,
       ]),
     ]);
 
-    var cells = shown.map(function (t, idx) {
+    var selBtn = function (key, label, enabled, title, onClick) {
+      return h("button", {
+        key: key, style: enabled ? BTN_STYLE : BTN_DISABLED,
+        disabled: !enabled, title: title, onClick: onClick,
+      }, label);
+    };
+
+    var selToolbar = h("div", {
+      key: "sel-toolbar",
+      style: { display: "flex", gap: 8, padding: "8px 12px",
+               alignItems: "center", borderBottom: "1px solid #2c2c2c",
+               background: "#141414", flexWrap: "wrap" },
+    }, [
+      h("span", { key: "lbl", style: { fontSize: 12, color: "#ddd",
+                   fontFamily: "ui-sans-serif, system-ui" } },
+        nSel + " selected"),
+      selBtn("sel-all", "Select all", shown.length > 0,
+             "Select all shown object trajectories", selectAllShown),
+      selBtn("sel-clear", "Clear", nSel > 0, "Clear the selection",
+             clearSelection),
+      h("input", {
+        key: "tag-input", value: tagText, placeholder: "tag (comma-sep)",
+        onChange: function (e) { setTagText(e.target.value); },
+        onKeyDown: function (e) { if (e.key === "Enter") applyTags("add"); },
+        style: { background: "#222", color: "#eee", border: "1px solid #444",
+                 borderRadius: 4, padding: "4px 8px", fontSize: 12,
+                 fontFamily: "ui-sans-serif, system-ui", width: 150,
+                 marginLeft: 4 },
+      }),
+      selBtn("tag-add", "Add tag", nSel > 0 && tagText.trim().length > 0,
+             "Add the tag(s) to the selected trajectories",
+             function () { applyTags("add"); }),
+      selBtn("tag-rm", "Remove tag", nSel > 0 && tagText.trim().length > 0,
+             "Remove the tag(s) from the selected trajectories",
+             function () { applyTags("remove"); }),
+      h("span", { key: "hint", style: { fontSize: 11, color: "#777",
+                   fontFamily: "ui-sans-serif, system-ui" } },
+        "ctrl/⌘-click: toggle · shift-click: range"),
+      h("button", {
+        key: "export",
+        style: Object.assign({}, (nSel > 0) ? BTN_STYLE : BTN_DISABLED,
+                             { marginLeft: "auto" }),
+        disabled: nSel === 0,
+        title: (nSel > 0)
+          ? "Download the selected trajectories as JSON"
+          : "Select trajectories first",
+        onClick: exportSelected,
+      }, "Export selected (.json)"),
+    ]);
+
+    // Cap the number of DOM cells we render (a flat all-scenes grid can be
+    // thousands). Select-all / filter / tag / export still act on the full
+    // `shown`/`rows` set — only the rendered cells are capped.
+    var MAX_CELLS = 600;
+    var rendered = shown.slice(0, MAX_CELLS);
+    var cells = rendered.map(function (t, idx) {
       var clickable = t.kind !== "ego";
+      var isSel = selected.has(selKey(t));
+      var tagChips = (t.tags || []).map(function (tg, ti) {
+        return h("span", { key: "tg-" + ti, style: {
+          background: "#3a2a12", color: "#ffb066", borderRadius: 3,
+          padding: "1px 5px", fontSize: 9, fontFamily: "ui-sans-serif, system-ui",
+        } }, tg);
+      });
       return h("div", {
         key: (t.scene_name || "") + ":" + t.track_idx + ":" + idx,
-        onClick: function () { openCellPatches(t); },
-        title: clickable ? "Show this track's patches" : "Ego trajectory",
+        onClick: function (e) { onCellClick(t, idx, e); },
+        title: clickable
+          ? "Click: patches · ctrl/⌘-click: select · shift-click: range"
+          : "Ego trajectory",
         style: {
-          background: "#161616", border: "1px solid #2c2c2c", borderRadius: 4,
+          position: "relative",
+          background: "#161616",
+          border: "1px solid " + (isSel ? V51_ORANGE : "#2c2c2c"),
+          borderRadius: 4,
           padding: 8, cursor: clickable ? "pointer" : "default",
           display: "flex", flexDirection: "column", gap: 4, width: 148,
         },
       }, [
+        isSel
+          ? h("div", { key: "badge", style: {
+              position: "absolute", top: 4, right: 4, width: 16, height: 16,
+              borderRadius: 8, background: V51_ORANGE, color: "#fff",
+              fontSize: 11, lineHeight: "16px", textAlign: "center",
+              fontFamily: "ui-sans-serif, system-ui" } }, "✓")
+          : null,
         h(TrajectoryThumb, { key: "thumb", tracklet: t, size: 130,
                              frame: trajFrame }),
         h("div", { key: "lbl", style: { fontSize: 11, color: "#eee",
@@ -1275,6 +1438,16 @@
                     fontFamily: "ui-monospace, monospace" } },
           t.n_frames + "f · gap " + (t.max_gap_s || 0).toFixed(1) + "s"
           + (t.n_distinct_classes > 1 ? " · ⚠cls" : "")),
+        (trajScene === "__all__")
+          ? h("div", { key: "scene", title: t.scene_name, style: { fontSize: 9,
+                color: "#6a6a6a", fontFamily: "ui-monospace, monospace",
+                whiteSpace: "nowrap", overflow: "hidden",
+                textOverflow: "ellipsis" } }, t.scene_name)
+          : null,
+        tagChips.length
+          ? h("div", { key: "tags", style: { display: "flex", flexWrap: "wrap",
+                        gap: 3 } }, tagChips)
+          : null,
       ]);
     });
 
@@ -1290,8 +1463,18 @@
       : h("div", { key: "grid", style: { display: "flex", flexWrap: "wrap",
                     gap: 10, padding: 12 } }, cells);
 
+    var banner = (shown.length > MAX_CELLS)
+      ? h("div", { key: "cap", style: { padding: "6px 12px", fontSize: 12,
+            color: "#ffb066", background: "#241a0c",
+            borderBottom: "1px solid #2c2c2c",
+            fontFamily: "ui-sans-serif, system-ui" } },
+          "Showing " + MAX_CELLS + " of " + shown.length
+          + " trajectories — pick a scene or apply a filter to narrow. "
+          + "Select all / tag / export still act on all " + shown.length + ".")
+      : null;
+
     return h("div", { style: { display: "flex", flexDirection: "column" } },
-             [toolbar, grid]);
+             [toolbar, selToolbar, banner, grid]);
   }
 
 

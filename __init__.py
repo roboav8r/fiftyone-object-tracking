@@ -72,6 +72,50 @@ def _resolve_lidar_slice(group_slices) -> str | None:
     return next((s for s in slices if "lidar" in s.lower()), None)
 
 
+def _detection_slices(ds) -> list[str]:
+    """Group slices whose flattened schema has a ``detections`` field.
+
+    Lidar cuboids + camera 2D boxes both carry the same FO ``instance``,
+    so tag write-through hits the track wherever it's viewed.
+    """
+    out: list[str] = []
+    for sl in list(ds.group_slices or []):
+        try:
+            if "detections" in ds.select_group_slices(sl).get_field_schema():
+                out.append(sl)
+        except Exception:
+            continue
+    return out
+
+
+def _instance_label_tags(lidar_view) -> dict[str, set]:
+    """Map ``instance._id`` hex -> union of its detection label tags.
+
+    Read in one aggregation over the scene's lidar detections so
+    build_trajectories can re-hydrate the tags applied by
+    tag_trajectories (the durable source of truth is the label tag).
+
+    Values are read *without* ``unwind`` so each sample yields a list
+    over its detections: ``iids_per_sample[i][j]`` is detection j's
+    ``instance._id`` and ``tags_per_sample[i][j]`` is its list of tags.
+    (Unwinding would flatten the per-detection ``tags`` list an extra
+    level and misalign it against the instance ids.)
+    """
+    iids_per_sample = lidar_view.values("detections.detections.instance._id")
+    tags_per_sample = lidar_view.values("detections.detections.tags")
+    out: dict[str, set] = {}
+    for sample_iids, sample_tags in zip(iids_per_sample, tags_per_sample):
+        if not sample_iids:
+            continue
+        for iid, tags in zip(sample_iids, sample_tags or []):
+            if iid is None:
+                continue
+            bucket = out.setdefault(str(iid), set())
+            if tags:
+                bucket.update(tags)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # 1. list_tracking_scenes
 # -----------------------------------------------------------------------------
@@ -397,6 +441,9 @@ def _record_to_tracklet(record: TrajectoryRecord, track_idx: int) -> dict:
     for name in _TRACKLET_SCALARS:
         out[name] = _json_scalar(getattr(record, name))
     out["tracking_id"] = str(out["tracking_id"])
+    # User-applied trajectory tags; re-hydrated from the underlying
+    # detection label tags by build_trajectories (see _instance_label_tags).
+    out["tags"] = []
     # Per-frame XY for the in-panel mini-BEV thumbnail (base + world; ego
     # also carries scene-local so its path isn't a degenerate dot).
     out["frame_indices"] = [int(x) for x in np.asarray(record.frame_indices).tolist()]
@@ -479,6 +526,13 @@ class BuildTrajectories(foo.Operator):
             tracklets = [
                 _record_to_tracklet(r, i) for i, r in enumerate(records)
             ]
+            # Re-hydrate trajectory tags from the underlying detection
+            # label tags (durable across rebuilds; written by tag_trajectories).
+            tag_map = _instance_label_tags(lidar_view)
+            for t in tracklets:
+                iid = t.get("instance_id")
+                if iid and str(iid) in tag_map:
+                    t["tags"] = sorted(tag_map[str(iid)])
             store.set(f"tracklets:{scene_name}", tracklets)
             built.append(scene_name)
             total += len(tracklets)
@@ -1192,6 +1246,236 @@ class ViewTrackPatches(foo.Operator):
 
 
 # -----------------------------------------------------------------------------
+# tag_trajectories — add / remove tags on selected trajectories
+# -----------------------------------------------------------------------------
+
+class TagTrajectories(foo.Operator):
+    """Add or remove tags on a set of selected trajectories.
+
+    Tags are written through to the underlying detection *label* tags —
+    every Detection sharing the trajectory's ``instance._id`` across every
+    group slice that has a ``detections`` field (the lidar cuboids and the
+    camera 2D boxes) — so they are durable, filterable in the App sidebar
+    wherever the track is viewed, and re-hydrated onto the tracklets by the
+    next ``build_trajectories``.
+    The built tracklets in the store are also updated in place so the
+    Trajectories-tab grid reflects the change immediately.
+
+    Inputs:
+      selection: list of {scene_name, instance_id, track_idx} — the
+        trajectories to (un)tag. Ego rows (no instance_id) are skipped.
+      tags: list[str] — the tags to add or remove.
+      mode: "add" (default) or "remove".
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="tag_trajectories",
+            label="Tag trajectories",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.list("selection", types.Object(), required=True)
+        inputs.list("tags", types.String(), required=True)
+        inputs.str("mode", required=False)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        from bson import ObjectId
+
+        ds = ctx.dataset
+        if ds is None:
+            return {"error": "No dataset loaded."}
+        lidar_slice = _resolve_lidar_slice(ds.group_slices)
+        if lidar_slice is None:
+            return {"error": "No lidar group slice found on this dataset."}
+
+        tags = [
+            str(t).strip()
+            for t in (ctx.params.get("tags") or [])
+            if str(t).strip()
+        ]
+        if not tags:
+            return {"error": "No tags given."}
+        mode = (ctx.params.get("mode") or "add").lower()
+        if mode not in ("add", "remove"):
+            return {"error": f"invalid mode {mode!r}"}
+
+        # Group the selection by scene, keeping only real (object) tracks.
+        by_scene: dict[str, list[str]] = {}
+        for item in (ctx.params.get("selection") or []):
+            scene = item.get("scene_name")
+            iid = item.get("instance_id")
+            if not scene or not iid:
+                continue
+            by_scene.setdefault(scene, []).append(str(iid))
+
+        # Every group slice carrying a ``detections`` field — the lidar
+        # cuboids plus the camera 2D boxes — shares the same instance ids,
+        # so the tag lands on the track wherever it's viewed.
+        det_slices = _detection_slices(ds)
+        if not det_slices:
+            return {"error": "No group slice has a 'detections' field."}
+
+        store = ctx.store(STORE_NAME)
+        n_tracklets = 0
+        n_labels = 0
+        by_scene_counts: dict[str, int] = {}
+
+        for scene, hexes in by_scene.items():
+            try:
+                oids = [ObjectId(h) for h in hexes]
+            except Exception as e:
+                return {"error": f"invalid instance hex in {hexes!r}: {e!r}"}
+
+            # ----- write-through to the detection label tags (all slices) -----
+            for sl in det_slices:
+                view = (
+                    ds.select_group_slices(sl)
+                      .match(F("scene_name") == scene)
+                      .filter_labels("detections", F("instance._id").is_in(oids))
+                )
+                if mode == "add":
+                    view.tag_labels(tags, label_fields="detections")
+                else:
+                    view.untag_labels(tags, label_fields="detections")
+                n_labels += int(view.count("detections.detections"))
+
+            # ----- mirror onto the built tracklets in the store -----
+            rows = store.get(f"tracklets:{scene}") or []
+            want = set(hexes)
+            for t in rows:
+                if str(t.get("instance_id")) in want:
+                    cur = set(t.get("tags") or [])
+                    if mode == "add":
+                        cur.update(tags)
+                    else:
+                        cur.difference_update(tags)
+                    t["tags"] = sorted(cur)
+                    n_tracklets += 1
+            store.set(f"tracklets:{scene}", rows)
+            by_scene_counts[scene] = len(hexes)
+
+        return {
+            "mode": mode,
+            "tags": tags,
+            "n_tracklets": n_tracklets,
+            "n_labels": n_labels,
+            "by_scene": by_scene_counts,
+        }
+
+
+# -----------------------------------------------------------------------------
+# export_trajectories — download the selected trajectories as JSON
+# -----------------------------------------------------------------------------
+
+_EXPORT_IDENT_FIELDS = (
+    "scene_name", "tracking_id", "instance_id", "tracking_name", "track_idx",
+)
+
+
+class ExportTrajectories(foo.Operator):
+    """Export the selected trajectories as a JSON file (browser download).
+
+    Builds a ``{scene_name: [record, ...]}`` document where each record
+    carries identifiers, the scalar metadata, the tags, and — when
+    ``include_xy`` — the per-frame base/world XY paths. Delivered via the
+    browser's download as a base64 ``data:`` URL, so it works on remote
+    FOE deployments with no server-served file.
+
+    Inputs:
+      selection: list of {scene_name, track_idx} (instance_id optional).
+      include_xy: bool (default True) — include xy_base / xy_world arrays.
+      filename: str (optional) — download filename.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="export_trajectories",
+            label="Export trajectories",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.list("selection", types.Object(), required=True)
+        inputs.bool("include_xy", default=True, required=False)
+        inputs.str("filename", required=False)
+        return types.Property(inputs)
+
+    def execute(self, ctx) -> dict[str, Any]:
+        import base64
+        import json
+
+        ds = ctx.dataset
+        store = ctx.store(STORE_NAME)
+        meta = store.get("meta") or {}
+        include_xy = bool(ctx.params.get("include_xy", True))
+
+        # scene -> set(track_idx) requested
+        want: dict[str, set] = {}
+        for item in (ctx.params.get("selection") or []):
+            scene = item.get("scene_name")
+            if scene is None:
+                continue
+            want.setdefault(scene, set()).add(int(item["track_idx"]))
+
+        scenes_out: dict[str, list] = {}
+        n = 0
+        for scene, idxs in want.items():
+            recs = []
+            for t in (store.get(f"tracklets:{scene}") or []):
+                if int(t["track_idx"]) not in idxs:
+                    continue
+                rec = {k: t.get(k) for k in _EXPORT_IDENT_FIELDS}
+                for k in _TRACKLET_SCALARS:
+                    rec[k] = t.get(k)
+                rec["tags"] = list(t.get("tags") or [])
+                if include_xy:
+                    rec["frame_indices"] = t.get("frame_indices")
+                    rec["xy_base"] = t.get("xy_base")
+                    rec["xy_world"] = t.get("xy_world")
+                recs.append(rec)
+                n += 1
+            if recs:
+                scenes_out[scene] = recs
+
+        doc = {
+            "source_dataset": meta.get("source") or (ds.name if ds else None),
+            "exported_at": time.time(),
+            "n_trajectories": n,
+            "include_xy": include_xy,
+            "scenes": scenes_out,
+        }
+
+        payload = json.dumps(doc, indent=2)
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        url = f"data:application/json;base64,{b64}"
+        filename = (ctx.params.get("filename") or "").strip()
+        if not filename:
+            src = (meta.get("source") or "trajectories").replace("/", "_")
+            filename = f"{src}_trajectories.json"
+        ctx.ops.browser_download(url, filename=filename)
+
+        return {
+            "n_trajectories": n,
+            "n_scenes": len(scenes_out),
+            "filename": filename,
+        }
+
+    def resolve_output(self, ctx):
+        outputs = types.Object()
+        outputs.int("n_trajectories", label="Trajectories exported")
+        outputs.int("n_scenes", label="Scenes")
+        outputs.str("filename", label="File")
+        return types.Property(outputs, view=types.View(label="Export complete"))
+
+
+# -----------------------------------------------------------------------------
 # Plugin registration
 # -----------------------------------------------------------------------------
 
@@ -1207,3 +1491,5 @@ def register(p):
     p.register(ClearTrajectoryFilter)
     p.register(ListTrajectoryFilters)
     p.register(DeleteTrajectoryFilter)
+    p.register(TagTrajectories)
+    p.register(ExportTrajectories)
