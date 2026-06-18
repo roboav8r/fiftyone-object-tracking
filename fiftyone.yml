@@ -1,5 +1,5 @@
 name: "@roboav8r/fiftyone-object-tracking"
-version: 0.4.5
+version: 0.4.6
 description: >
   FiftyOne plugin for working with grouped 3D tracking datasets:
   a generic Object Tracking panel with a per-scene bird's-eye-view

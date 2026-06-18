@@ -1939,17 +1939,19 @@
 
       var ty = py(threshold);
 
-      // Highlight every selected cluster's leaf positions. A singleton cluster
-      // has no below-threshold link of its own (its only mark is a leaf stub on
-      // an above-threshold, gray link), so without this it can't be highlighted
-      // — draw a thick colored stub from the baseline up to the cut, plus a base
-      // dot, at each member leaf's x. Also reinforces multi-leaf selections.
+      // Highlight selected SINGLETON clusters only. A one-member cluster has no
+      // below-threshold link of its own (its only mark is a leaf stub on an
+      // above-threshold, gray link), so it can't otherwise be highlighted — draw
+      // a colored stub from the baseline up to the cut, plus a base dot, at its
+      // leaf x. Multi-member clusters already read from their colored links, so
+      // leaving them untouched keeps the dendrogram uncluttered.
       var leafHi = [];
       if (anySel) {
         var yBase = py(0);
         for (var lp = 0; lp < n; lp++) {
           var lc = labels[leaves[lp]];
           if (!selectedClusterIds.has(lc)) continue;
+          if (!derived.clusters[lc] || derived.clusters[lc].length !== 1) continue;
           var lx = px(5 + 10 * lp);
           var lcol = clusterColor(lc);
           leafHi.push(h("line", { key: "lh" + lp, x1: lx, y1: yBase,
