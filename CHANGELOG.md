@@ -26,8 +26,77 @@ once it leaves `0.x`.
   completion `callback` (FiftyOne ≥2.18) instead of a fixed poll that started on
   click — so a newly saved filter and the regrid appear without a manual refresh.
 
+### Fixed
+
+- **Clicking a cluster now lands the selection in the Trajectories grid.**
+  `select_trajectories` had no `resolve_input`, so on FiftyOne ≥ 2.18 the
+  executor dropped its `selection` param and the operator silently *cleared*
+  the selection instead of setting it. It now declares its input schema and
+  takes a list of `{scene_name, track_idx}` (matching `tag_trajectories` /
+  `export_trajectories`).
+
 ### Added
 
+- **Normalized cluster preview.** The Clusters-tab side preview has a
+  **Normalized | Raw** toggle. *Normalized* (default) applies the same
+  `origin_normalize` the clustering uses — every path starts at a common origin
+  (marked), aligned by its start→end chord — so straight / left / right turns
+  separate visually and match the cluster assignment. *Raw* shows the actual
+  frame geography. (Ego in the base frame is a single point; use World or
+  Scene-local for ego.)
+- **Pool trajectories across scenes ("All scenes").** Clustering "All scenes"
+  now builds ONE dendrogram over the chosen classes from every scene (stored
+  under `__all__`), so e.g. every run's ego path clusters together, or all cars
+  across runs. Single-scene clustering is unchanged. Cluster members are now
+  tracked as `(scene, track_idx)` pairs end-to-end.
+- **Ego is a clusterable class.** Ego appears in the class picker; with cross-
+  scene pooling you can cluster the per-run ego paths against each other.
+- **Select multiple clusters.** **ctrl/⌘-click** a cluster swatch to add it to
+  the selection (plain click still replaces); tag / export act on the union.
+- **Save & recall clustering runs.** "Cluster trajectories…" has a **Save run
+  as** field; the Clusters tab has a **Saved run** dropdown with **Apply**
+  (re-runs that configuration — scene, classes, frame, cut, …) and delete.
+  Saved per user; survives rebuilds (it stores the configuration, not the
+  cached result).
+- **Tag & export a cluster in place.** The Clusters tab now has an inline
+  selection toolbar (shown once a cluster is clicked): **Add tag** / **Remove
+  tag** (written through to the underlying detection labels), **Export
+  (.json)**, and **Clear** — no more hopping to the Trajectories tab.
+- **Cluster a subset of classes.** `cluster_trajectories` takes an optional
+  multi-select of object classes (default: all), so you can cluster, say, only
+  vehicles or only pedestrians — fewer, clearer clusters and faster compute.
+  (Ego is excluded — one track per scene.) The class set is part of the per-scene
+  params fingerprint, so changing it re-clusters rather than serving stale cache.
+- **Delegated execution for `cluster_trajectories`.** Large/all-scenes runs can
+  be scheduled as a delegated operation instead of blocking the App (immediate
+  execution stays available for small scenes). Requires a delegated-operation
+  orchestrator on the deployment; the Clusters tab notes that results arrive
+  asynchronously — use ↻ to refresh.
+- **Cluster trajectories by shape (DTW + hierarchical clustering).** A new
+  **Clusters** tab groups a scene's object trajectories by *shape* using
+  Dynamic Time Warping (speed/sampling invariant) + agglomerative clustering,
+  and renders the merge tree as an interactive dendrogram. **Drag the cut line**
+  to re-cluster live (the cut is recomputed client-side from the linkage matrix
+  — no server round-trip); **click a cluster** to select its trajectories. A
+  side BEV preview colors the paths by cluster. Selection reuses the existing
+  `filter_selection` plumbing, so the Trajectories grid highlights the same
+  set. Clustering is per-scene; rebuilding trajectories invalidates it.
+- **`cluster_trajectories`** (listed) — compute the DTW distance matrix +
+  hierarchical clustering for one scene or all built scenes and store the
+  linkage, cut, and dendrogram geometry under `clusters:{scene}`. Shape
+  normalization (`origin_normalize`) is on by default so clustering groups by
+  shape regardless of position/heading. DTW is `O(N²·T²)`, so paths are
+  arc-length-downsampled to `resample_points` (default 30) before DTW and each
+  scene is capped at `max_tracks` (default 400, longest tracks kept) with a
+  "Clustered N of M" banner — no silent truncation. An optional Sakoe-Chiba
+  `band` bounds the warp. (DTW runs serially: spawning subprocesses inside an
+  operator worker is unreliable, and resampling + the cap keep it fast.)
+- **`get_clusters`** (unlisted) — cheap read path for the Clusters tab, so
+  switching scenes never re-runs the `O(N²)` compute.
+- **`select_trajectories`** (unlisted) — write a raw `{scene: [track_idx]}`
+  selection into `filter_selection`; the seam that converges any selection
+  source (a clicked cluster, future similarity search) onto the existing
+  highlight path.
 - **Tag & export selected trajectories.** The Trajectories grid is now
   multi-selectable: **ctrl/⌘-click** toggles one trajectory, **shift-click**
   range-selects from the last-clicked anchor, and a **Select all** button

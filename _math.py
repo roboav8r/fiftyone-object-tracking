@@ -118,6 +118,28 @@ def origin_normalize(xy: np.ndarray) -> np.ndarray:
     return p @ rot.T
 
 
+def resample_arclength(xy: np.ndarray, n: int) -> np.ndarray:
+    """Resample a path to ``n`` points evenly spaced along its arc length.
+
+    Only *downsamples* (returns the path unchanged when it already has
+    ``<= n`` points), so it caps the per-path length that feeds the
+    ``O(T^2)`` DTW without inflating short paths. Endpoints are preserved.
+    Degenerate (stationary / <2-point) paths are returned unchanged.
+    """
+    xy = np.asarray(xy, dtype=np.float64)
+    if n <= 1 or xy.shape[0] <= n or xy.shape[0] < 2:
+        return xy
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    d = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(d[-1])
+    if total <= 0.0:
+        return xy  # stationary; nothing meaningful to resample
+    t = np.linspace(0.0, total, n)
+    x = np.interp(t, d, xy[:, 0])
+    y = np.interp(t, d, xy[:, 1])
+    return np.stack([x, y], axis=1)
+
+
 def heading_change_deg(xy: np.ndarray) -> float:
     """Smoothed turning angle in degrees, +CCW; wrapped to (-180, 180]."""
     n = xy.shape[0]

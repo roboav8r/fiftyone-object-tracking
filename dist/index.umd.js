@@ -1479,6 +1479,681 @@
 
 
   // ---------------------------------------------------------------------------
+  // Clusters tab — DTW + hierarchical clustering dendrogram.
+  // ---------------------------------------------------------------------------
+
+  // Distinct hue per (1-based) cluster id; gray for the un-clustered "trunk".
+  function clusterColor(id) {
+    if (id == null || id <= 0) return "#777";
+    return "hsl(" + CLASS_HUE_PALETTE[(id - 1) % CLASS_HUE_PALETTE.length]
+      + ", 65%, 55%)";
+  }
+
+  // Cut a scipy linkage matrix Z at `threshold`, client-side, into flat
+  // cluster labels (1-based, indexed by observation/leaf index 0..n-1).
+  // Equivalent to fcluster(Z, t=threshold, criterion="distance"); lets the
+  // threshold drag re-label instantly with no server round-trip. Union-find
+  // over the merges whose height <= threshold (Z rows are height-ascending).
+  function cutLinkage(Z, threshold, n) {
+    var parent = new Array(2 * n - 1);
+    for (var i = 0; i < parent.length; i++) parent[i] = i;
+    function find(x) {
+      while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    }
+    for (var k = 0; k < Z.length; k++) {
+      if (Z[k][2] > threshold) continue;
+      var node = n + k;
+      parent[find(Z[k][0] | 0)] = node;
+      parent[find(Z[k][1] | 0)] = node;
+    }
+    var rootToId = Object.create(null), labels = new Array(n), next = 1;
+    for (var j = 0; j < n; j++) {
+      var r = find(j);
+      if (!(r in rootToId)) rootToId[r] = next++;
+      labels[j] = rootToId[r];
+    }
+    return labels;
+  }
+
+  // Mirror of _math.origin_normalize: translate a path to the origin and
+  // rotate so the start→end chord points along +x. Lets the preview show the
+  // same shape-normalized view the clustering uses (so straight / left / right
+  // separate from a common origin). Takes/returns parallel xs/ys arrays.
+  function originNormalize(xs, ys) {
+    var n = xs.length;
+    if (n < 1) return [xs, ys];
+    var px = [], py = [], i;
+    for (i = 0; i < n; i++) { px.push(xs[i] - xs[0]); py.push(ys[i] - ys[0]); }
+    if (n < 2) return [px, py];
+    var dx = px[n - 1], dy = py[n - 1];
+    var chord = Math.hypot(dx, dy);
+    if (chord < 1e-6) return [px, py];
+    var c = dx / chord, s = dy / chord;   // rot = [[c, s], [-s, c]]; p @ rot.T
+    var rx = [], ry = [];
+    for (i = 0; i < n; i++) {
+      rx.push(px[i] * c + py[i] * s);
+      ry.push(-px[i] * s + py[i] * c);
+    }
+    return [rx, ry];
+  }
+
+  function ClustersTab(props) {
+    var promptInput = foo.usePromptOperatorInput();
+    var getClustersOp = foo.useOperatorExecutor(OP("get_clusters"));
+    var getTrajOp = foo.useOperatorExecutor(OP("get_trajectories"));
+    var selectTrajOp = foo.useOperatorExecutor(OP("select_trajectories"));
+    var tagTrajOp = foo.useOperatorExecutor(OP("tag_trajectories"));
+    var exportTrajOp = foo.useOperatorExecutor(OP("export_trajectories"));
+    var applyRunOp = foo.useOperatorExecutor(OP("cluster_trajectories"));
+    var listRunsOp = foo.useOperatorExecutor(OP("list_cluster_runs"));
+    var deleteRunOp = foo.useOperatorExecutor(OP("delete_cluster_run"));
+
+    var [clustersByScene, setClustersByScene] = useState({});
+    var [clusterMeta, setClusterMeta] = useState(null);
+    var [viewScene, setViewScene] = useState(props.selectedScene || "");
+    var [refreshTick, setRefreshTick] = useState(0);
+    var [threshold, setThreshold] = useState(null);
+    // Multiple clusters can be selected at once (ctrl/⌘-click to add).
+    var [selectedClusterIds, setSelectedClusterIds] = useState(function () { return new Set(); });
+    var [trackById, setTrackById] = useState({});
+    var [tagText, setTagText] = useState("");
+    var [savedRuns, setSavedRuns] = useState([]);
+    var [selectedRun, setSelectedRun] = useState("");
+    // Preview in normalized shape-space (default) or raw frame coordinates.
+    var [previewNorm, setPreviewNorm] = useState(true);
+    var [loaded, setLoaded] = useState(false);
+
+    var svgRef = useRef(null);
+    var geomRef = useRef({});
+    var draggingRef = useRef(false);
+
+    function bump() { setRefreshTick(function (x) { return x + 1; }); }
+    // Members can come from several scenes (pooled "All scenes"), so key the
+    // tracklet map by (scene, track_idx), not track_idx alone.
+    function keyOf(scene, idx) { return scene + "::" + idx; }
+    // Uniform member list; compat shim for blobs from before the members field.
+    function blobMembers(b) {
+      if (!b) return [];
+      if (b.members) return b.members;
+      return (b.track_idxs || []).map(function (ti) {
+        return { scene_name: b.scene_name, track_idx: ti };
+      });
+    }
+    var poolView = viewScene === "__all__";
+
+    // Load stored clusters on mount / refresh (cheap read; no DTW recompute).
+    useEffect(function () {
+      try { getClustersOp.execute({}); }
+      catch (e) { console.error("[obj-track] get_clusters throw", e); }
+    }, [refreshTick]);
+
+    var lastClusters = useRef(null);
+    useEffect(function () {
+      var r = getClustersOp.result;
+      if (!r || r === lastClusters.current) return;
+      lastClusters.current = r;
+      var out = r.result || r;
+      var cs = (out && out.clusters) || {};
+      setClustersByScene(cs);
+      setClusterMeta((out && out.clusters_meta) || null);
+      setLoaded(true);
+      var keys = Object.keys(cs);
+      setViewScene(function (prev) {
+        if (prev && cs[prev]) return prev;
+        if (props.selectedScene && cs[props.selectedScene]) return props.selectedScene;
+        return keys[0] || "";
+      });
+    }, [getClustersOp.result]);
+
+    var blob = clustersByScene[viewScene] || null;
+
+    // Reset the cut line + selection when the blob changes.
+    useEffect(function () {
+      if (blob && !blob.error) {
+        setThreshold(blob.threshold);
+        setSelectedClusterIds(new Set());
+      }
+    }, [blob]);
+
+    // Fetch tracklets for the preview / tag-export. A pooled view spans every
+    // scene, so fetch all (scene_name=null); a single-scene view fetches one.
+    useEffect(function () {
+      if (!viewScene) return;
+      try { getTrajOp.execute({ scene_name: poolView ? null : viewScene }); }
+      catch (e) { console.error("[obj-track] get_trajectories throw", e); }
+    }, [viewScene, refreshTick]);
+
+    var lastTraj = useRef(null);
+    useEffect(function () {
+      var r = getTrajOp.result;
+      if (!r || r === lastTraj.current) return;
+      lastTraj.current = r;
+      var out = r.result || r;
+      var rows = (out && out.tracklets) || [];
+      var map = {};
+      rows.forEach(function (t) { map[keyOf(t.scene_name, t.track_idx)] = t; });
+      setTrackById(map);
+    }, [getTrajOp.result]);
+
+    // Saved clustering runs (per user) for the recall dropdown.
+    useEffect(function () {
+      try { listRunsOp.execute({}); }
+      catch (e) { console.error("[obj-track] list_cluster_runs throw", e); }
+    }, [refreshTick]);
+    var lastRuns = useRef(null);
+    useEffect(function () {
+      var r = listRunsOp.result;
+      if (!r || r === lastRuns.current) return;
+      lastRuns.current = r;
+      var out = r.result || r;
+      setSavedRuns((out && out.runs) || []);
+    }, [listRunsOp.result]);
+
+    // Threshold drag: window-level listeners read live geometry from geomRef.
+    useEffect(function () {
+      function onMove(e) {
+        if (!draggingRef.current || !svgRef.current) return;
+        var g = geomRef.current;
+        if (!g.plotH) return;
+        var rect = svgRef.current.getBoundingClientRect();
+        var yView = (e.clientY - rect.top) * (g.H / rect.height);
+        var d = g.dMaxH * (1 - (yView - g.top) / g.plotH);
+        setThreshold(Math.max(0, Math.min(g.dMaxH, d)));
+      }
+      function onUp() { draggingRef.current = false; }
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      return function () {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+    }, []);
+
+    // Client-side cut → per-observation labels + cluster → [member] map.
+    var derived = useMemo(function () {
+      if (!blob || blob.error || threshold == null) return null;
+      var n = blob.n_clustered;
+      var members = blobMembers(blob);
+      var labels = cutLinkage(blob.Z, threshold, n);
+      var clusters = {};
+      for (var r = 0; r < n; r++) {
+        var c = labels[r];
+        (clusters[c] = clusters[c] || []).push(members[r]);
+      }
+      return { labels: labels, clusters: clusters, members: members };
+    }, [blob, threshold]);
+
+    // Union of the selected clusters' members (each {scene_name, track_idx}).
+    function unionMembers(idSet) {
+      if (!derived) return [];
+      var out = [];
+      idSet.forEach(function (cid) {
+        (derived.clusters[cid] || []).forEach(function (m) { out.push(m); });
+      });
+      return out;
+    }
+    function pushSelection(idSet) {
+      var sel = unionMembers(idSet).map(function (m) {
+        return { scene_name: m.scene_name, track_idx: m.track_idx };
+      });
+      try { selectTrajOp.execute({ selection: sel, source: "cluster" }); }
+      catch (e) { console.error("[obj-track] select_trajectories throw", e); }
+    }
+    function onClusterClick(cid, e) {
+      var additive = e && (e.ctrlKey || e.metaKey || e.shiftKey);
+      var prev = selectedClusterIds;
+      var next;
+      if (additive) {
+        next = new Set(prev);
+        if (next.has(cid)) next.delete(cid); else next.add(cid);
+      } else {
+        next = (prev.size === 1 && prev.has(cid)) ? new Set() : new Set([cid]);
+      }
+      setSelectedClusterIds(next);
+      pushSelection(next);
+    }
+    function clearClusterSelection() {
+      setSelectedClusterIds(new Set());
+      try { selectTrajOp.execute({ selection: [] }); }
+      catch (e) { console.error("[obj-track] clear selection throw", e); }
+    }
+
+    // ----- act on the selected clusters in place (tag / export) -----
+    var anySel = selectedClusterIds.size > 0;
+    var selMembers = unionMembers(selectedClusterIds);
+    // Export works on any track (scene + track_idx). Tagging needs the FO
+    // instance id and is meaningless for ego (no detection labels), so it
+    // resolves through the loaded tracklets and drops ego/missing.
+    var exportItems = selMembers.map(function (m) {
+      return { scene_name: m.scene_name, track_idx: m.track_idx };
+    });
+    var tagItems = selMembers
+      .map(function (m) { return trackById[keyOf(m.scene_name, m.track_idx)]; })
+      .filter(function (t) { return t && t.kind !== "ego" && t.instance_id; })
+      .map(function (t) {
+        return { scene_name: t.scene_name, instance_id: t.instance_id,
+                 track_idx: t.track_idx };
+      });
+
+    function applyClusterTags(mode) {
+      var tags = tagText.split(",").map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length; });
+      if (!tags.length || !tagItems.length) return;
+      try {
+        tagTrajOp.execute({ selection: tagItems, tags: tags, mode: mode },
+                          { callback: bump });  // re-fetch so tag chips refresh
+      } catch (e) { console.error("[obj-track] tag_trajectories throw", e); }
+    }
+    function exportSelected() {
+      if (!exportItems.length) return;
+      try {
+        exportTrajOp.execute({ selection: exportItems, include_xy: true });
+      } catch (e) { console.error("[obj-track] export_trajectories throw", e); }
+    }
+
+    // ----- saved-run recall -----
+    function applyRun(name) {
+      var run = null;
+      for (var i = 0; i < savedRuns.length; i++) {
+        if (savedRuns[i].name === name) { run = savedRuns[i]; break; }
+      }
+      if (!run) return;
+      var p = Object.assign({}, run.params || {},
+        { scene: run.scene, max_tracks: run.max_tracks });
+      var targetView = run.scene === "__all__" ? "__all__" : run.scene;
+      try {
+        applyRunOp.execute(p, { callback: function () {
+          setViewScene(targetView); bump();
+        } });
+      } catch (e) { console.error("[obj-track] apply run throw", e); }
+    }
+    function deleteRun(name) {
+      try { deleteRunOp.execute({ name: name }, { callback: bump }); }
+      catch (e) { console.error("[obj-track] delete_cluster_run throw", e); }
+    }
+
+    // ----- toolbar -----
+    var scenes = clusterMeta && clusterMeta.scenes ? clusterMeta.scenes
+      : Object.keys(clustersByScene);
+    function sceneLabel(s) { return s === "__all__" ? "All scenes (pooled)" : s; }
+    var toolbar = h("div", {
+      key: "cl-toolbar",
+      style: { display: "flex", gap: 8, padding: "8px 12px",
+               alignItems: "center", borderBottom: "1px solid #2c2c2c",
+               background: "#171717", flexWrap: "wrap" },
+    }, [
+      h("button", {
+        key: "cluster", style: BTN_STYLE,
+        title: "Compute DTW + hierarchical clustering (pick scene/classes in the form)",
+        onClick: function () {
+          try {
+            var preset = {};
+            var sc = (viewScene && viewScene !== "__all__")
+              ? viewScene : props.selectedScene;
+            if (sc) preset.scene = sc;
+            promptInput(OP("cluster_trajectories"), preset, { callback: bump });
+          } catch (e) { console.error("[obj-track] prompt cluster throw", e); }
+        },
+      }, "Cluster trajectories…"),
+      h("button", {
+        key: "refresh", style: BTN_STYLE, title: "Reload clusters from the store",
+        onClick: bump,
+      }, "↻"),
+      scenes.length
+        ? h("label", { key: "scene-pick", style: { display: "flex", gap: 4,
+              alignItems: "center", marginLeft: 4, fontSize: 11, color: "#888",
+              fontFamily: "ui-sans-serif, system-ui" } }, [
+            "View:",
+            h("select", {
+              key: "scene-sel", value: viewScene,
+              style: { background: "#222", color: "#eee",
+                       border: "1px solid #444", borderRadius: 4, fontSize: 11,
+                       maxWidth: 240 },
+              onChange: function (e) { setViewScene(e.target.value); },
+            }, scenes.map(function (s) {
+              return h("option", { key: s, value: s }, sceneLabel(s));
+            })),
+          ])
+        : null,
+      h("span", { key: "status", style: { marginLeft: 8, fontSize: 12,
+                   color: "#aaa", fontFamily: "ui-sans-serif, system-ui" } },
+        getClustersOp.isExecuting || applyRunOp.isExecuting ? "working…"
+          : (derived
+              ? (Object.keys(derived.clusters).length + " clusters at this cut")
+              : "")),
+      h("span", { key: "deleg-hint", style: { marginLeft: "auto", fontSize: 11,
+                   color: "#777", fontFamily: "ui-sans-serif, system-ui" } },
+        "Large runs may be scheduled — use ↻ to refresh when they finish."),
+    ]);
+
+    // ----- saved-runs bar -----
+    var runsBar = h("div", {
+      key: "cl-runsbar",
+      style: { display: "flex", gap: 8, padding: "6px 12px",
+               alignItems: "center", borderBottom: "1px solid #2c2c2c",
+               background: "#141414", flexWrap: "wrap" },
+    }, [
+      h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
+        fontFamily: "ui-sans-serif, system-ui" } }, "Saved run:"),
+      h("select", {
+        key: "run-sel", value: selectedRun,
+        style: { background: "#222", color: "#eee", border: "1px solid #444",
+                 borderRadius: 4, fontSize: 11, maxWidth: 220 },
+        onChange: function (e) { setSelectedRun(e.target.value); },
+      }, [h("option", { key: "_none", value: "" }, "(none)")].concat(
+        savedRuns.map(function (rn) {
+          return h("option", { key: rn.name, value: rn.name }, rn.name);
+        }))),
+      h("button", {
+        key: "apply-run", style: selectedRun ? BTN_STYLE : BTN_DISABLED,
+        disabled: !selectedRun,
+        title: selectedRun ? "Re-run this saved configuration" : "Pick a saved run",
+        onClick: function () { if (selectedRun) applyRun(selectedRun); },
+      }, "Apply"),
+      selectedRun
+        ? h("button", { key: "del-run",
+            style: Object.assign({}, BTN_STYLE, { padding: "3px 8px", background: "#5a2a2a" }),
+            title: "Delete this saved run",
+            onClick: function () { deleteRun(selectedRun); setSelectedRun(""); },
+          }, "✕")
+        : null,
+      h("span", { key: "hint", style: { fontSize: 11, color: "#777",
+        fontFamily: "ui-sans-serif, system-ui" } },
+        "Save a run from the \"Cluster trajectories…\" form (Save run as)."),
+    ]);
+
+    // ----- banner (cap / warnings) -----
+    var banner = null;
+    if (blob && !blob.error && (blob.capped || (blob.warnings && blob.warnings.length))) {
+      var msgs = [];
+      if (blob.capped) {
+        msgs.push("Clustered " + blob.n_clustered + " of " + blob.n_total
+          + " trajectories (longest kept; raise Max trajectories to include more).");
+      }
+      if (blob.warnings && blob.warnings.length) msgs.push(blob.warnings.join("; "));
+      banner = h("div", { key: "cl-banner", style: { padding: "6px 12px",
+          fontSize: 12, color: "#ffb066", background: "#241a0c",
+          borderBottom: "1px solid #2c2c2c",
+          fontFamily: "ui-sans-serif, system-ui" } }, msgs.join(" "));
+    }
+
+    // ----- empty / error states -----
+    if (loaded && (!scenes.length || !blob)) {
+      return h("div", { style: { display: "flex", flexDirection: "column" } }, [
+        toolbar, runsBar,
+        h("div", { key: "empty", style: { padding: 24, color: "#888",
+            fontFamily: "ui-sans-serif, system-ui", fontSize: 13,
+            textAlign: "center" } },
+          "No clusters yet. Build trajectories, then click "
+          + "\"Cluster trajectories…\" to group them by shape "
+          + "(pick a class subset, or All scenes to pool — e.g. ego across runs)."),
+      ]);
+    }
+    if (blob && blob.error) {
+      return h("div", { style: { display: "flex", flexDirection: "column" } }, [
+        toolbar, runsBar,
+        h("div", { key: "err", style: { padding: 24, color: "#e07a7a",
+            fontFamily: "ui-sans-serif, system-ui", fontSize: 13,
+            textAlign: "center" } }, blob.error),
+      ]);
+    }
+
+    // ----- dendrogram SVG -----
+    var dendro = null;
+    if (blob && !blob.error && derived && threshold != null) {
+      var n = blob.n_clustered, ico = blob.icoord, dco = blob.dcoord,
+          leaves = blob.leaves, labels = derived.labels;
+      var W = 900, H = 320, mL = 46, mR = 16, mT = 14, mB = 56;
+      var plotW = W - mL - mR, plotH = H - mT - mB;
+      var xMax = 10 * n;
+      var dMax = 0;
+      for (var di = 0; di < dco.length; di++) {
+        for (var dj = 0; dj < dco[di].length; dj++) {
+          if (dco[di][dj] > dMax) dMax = dco[di][dj];
+        }
+      }
+      var dMaxH = dMax > 0 ? dMax * 1.05 : 1;
+      geomRef.current = { H: H, top: mT, plotH: plotH, dMaxH: dMaxH };
+      var px = function (icoVal) { return mL + (icoVal / xMax) * plotW; };
+      var py = function (d) { return mT + (1 - d / dMaxH) * plotH; };
+
+      var links = ico.map(function (seg, k) {
+        var d4 = dco[k];
+        var below = d4[1] <= threshold;
+        var color = "#5a5a5a";
+        if (below) {
+          var p0 = Math.round((seg[0] - 5) / 10);
+          p0 = Math.max(0, Math.min(n - 1, p0));
+          var cid = labels[leaves[p0]];
+          color = (anySel && !selectedClusterIds.has(cid))
+            ? "#3a3a3a" : clusterColor(cid);
+        }
+        var pts = [[seg[0], d4[0]], [seg[1], d4[1]], [seg[2], d4[2]], [seg[3], d4[3]]]
+          .map(function (p) { return px(p[0]).toFixed(1) + "," + py(p[1]).toFixed(1); })
+          .join(" ");
+        return h("polyline", { key: "lk" + k, points: pts, fill: "none",
+          stroke: color, strokeWidth: below ? 1.7 : 1.0,
+          strokeOpacity: below ? 0.95 : 0.45 });
+      });
+
+      var ty = py(threshold);
+      var axis = h("text", { key: "ax", x: 13, y: mT + plotH / 2, fill: "#888",
+        fontSize: 10, fontFamily: "ui-sans-serif, system-ui",
+        transform: "rotate(-90 13," + (mT + plotH / 2) + ")",
+        textAnchor: "middle" }, "DTW distance");
+      var startDrag = function (e) { draggingRef.current = true; e.preventDefault(); };
+      var lineGrab = h("line", { key: "thg", x1: mL, y1: ty, x2: W - mR, y2: ty,
+        stroke: "transparent", strokeWidth: 12, style: { cursor: "ns-resize" },
+        onMouseDown: startDrag });
+      var threshLine = h("line", { key: "th", x1: mL, y1: ty, x2: W - mR, y2: ty,
+        stroke: V51_ORANGE, strokeWidth: 1.5, strokeDasharray: "5,4",
+        style: { pointerEvents: "none" } });
+      var handle = h("rect", { key: "thh", x: W - mR - 7, y: ty - 5, width: 14,
+        height: 10, rx: 2, fill: V51_ORANGE, style: { cursor: "ns-resize" },
+        onMouseDown: startDrag });
+      var threshLabel = h("text", { key: "thl", x: mL + 4, y: ty - 4,
+        fill: V51_ORANGE, fontSize: 10, fontFamily: "ui-monospace, monospace",
+        style: { pointerEvents: "none" } }, "cut " + threshold.toFixed(1));
+
+      dendro = h("svg", { key: "dendro", ref: svgRef,
+        viewBox: "0 0 " + W + " " + H, width: "100%", height: H,
+        style: { background: "#141414", border: "1px solid #2c2c2c",
+                 borderRadius: 4, display: "block", maxWidth: "100%" } },
+        [].concat(links, [lineGrab, threshLine, handle, threshLabel, axis]));
+    }
+
+    // ----- BEV preview: clustered paths, colored by cluster -----
+    // "Normalized" applies the same origin_normalize the clustering uses, so
+    // straight / left / right separate from a common origin; "Raw" shows the
+    // actual frame geography. (Ego in base frame is a single point — use World
+    // or Scene-local for ego.)
+    var preview = null;
+    if (blob && !blob.error && derived) {
+      var frameKey = blob.frame === "base" ? "xy_base"
+        : (blob.frame === "scene_local" ? "xy_scene_local" : "xy_world");
+      var paths = [];
+      var pxMin = Infinity, pxMax = -Infinity, pyMin = Infinity, pyMax = -Infinity;
+      var pvMembers = derived.members;
+      for (var ri = 0; ri < pvMembers.length; ri++) {
+        var pm = pvMembers[ri];
+        var tk = trackById[keyOf(pm.scene_name, pm.track_idx)];
+        if (!tk) continue;
+        var xy = tk[frameKey] || [];
+        var xs = [], ys = [];
+        for (var pi = 0; pi < xy.length; pi++) {
+          if (isFiniteNum(xy[pi][0]) && isFiniteNum(xy[pi][1])) {
+            xs.push(xy[pi][0]); ys.push(xy[pi][1]);
+          }
+        }
+        if (xs.length < 2) continue;
+        if (previewNorm) { var nn = originNormalize(xs, ys); xs = nn[0]; ys = nn[1]; }
+        for (var b = 0; b < xs.length; b++) {
+          if (xs[b] < pxMin) pxMin = xs[b];
+          if (xs[b] > pxMax) pxMax = xs[b];
+          if (ys[b] < pyMin) pyMin = ys[b];
+          if (ys[b] > pyMax) pyMax = ys[b];
+        }
+        paths.push({ xs: xs, ys: ys, cid: derived.labels[ri] });
+      }
+      var pvToggleBtn = function (norm, label) {
+        var on = previewNorm === norm;
+        return h("button", { key: "pv-" + label,
+          onClick: function () { setPreviewNorm(norm); },
+          style: { background: on ? V51_ORANGE : "transparent",
+            color: on ? "#fff" : "#aaa",
+            border: "1px solid " + (on ? V51_ORANGE : "#444"),
+            borderRadius: 4, padding: "2px 8px", cursor: "pointer", fontSize: 11,
+            fontFamily: "ui-sans-serif, system-ui" } }, label);
+      };
+      var pvHeader = h("div", { key: "pv-hd", style: { display: "flex", gap: 6,
+        alignItems: "center" } }, [
+        h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
+          fontFamily: "ui-sans-serif, system-ui", marginRight: 2 } }, "Preview:"),
+        pvToggleBtn(true, "Normalized"), pvToggleBtn(false, "Raw"),
+      ]);
+
+      var pvSvg;
+      if (paths.length && pxMax > pxMin && pyMax > pyMin) {
+        var PW = 360, PH = 320, pad = 0.08;
+        var spanX = pxMax - pxMin, spanY = pyMax - pyMin;
+        var p1x = pxMax + pad * spanX, p1y = pyMax + pad * spanY;
+        var dXp = (pxMax - pxMin) + 2 * pad * spanX;
+        var dYp = (pyMax - pyMin) + 2 * pad * spanY;
+        var sp = Math.min(PW / dYp, PH / dXp);
+        var oxp = (PW - sp * dYp) / 2, oyp = (PH - sp * dXp) / 2;
+        var projp = function (x, y) {
+          // forward (x) → screen y inverted; left (y) → screen x inverted.
+          return [oxp + sp * (p1y - y), oyp + sp * (p1x - x)];
+        };
+        var polylines = paths.map(function (pth, idx) {
+          var on = !anySel || selectedClusterIds.has(pth.cid);
+          var s = [];
+          for (var q = 0; q < pth.xs.length; q++) {
+            var pp = projp(pth.xs[q], pth.ys[q]);
+            s.push(pp[0].toFixed(1) + "," + pp[1].toFixed(1));
+          }
+          return h("polyline", { key: "pp" + idx, points: s.join(" "),
+            fill: "none", stroke: on ? clusterColor(pth.cid) : "#333",
+            strokeWidth: on ? 1.5 : 0.8, strokeOpacity: on ? 0.9 : 0.4 });
+        });
+        // Origin marker in normalized mode (every path starts here).
+        if (previewNorm) {
+          var o = projp(0, 0);
+          polylines = polylines.concat([h("circle", { key: "origin",
+            cx: o[0].toFixed(1), cy: o[1].toFixed(1), r: 3, fill: "#2bff7f",
+            stroke: "#0a0a0a", strokeWidth: 0.7 })]);
+        }
+        pvSvg = h("svg", { key: "preview-svg",
+          viewBox: "0 0 " + PW + " " + PH, width: PW, height: PH,
+          style: { background: "#0a0a0a", border: "1px solid #2c2c2c",
+                   borderRadius: 4, display: "block" } }, polylines);
+      } else {
+        pvSvg = h("div", { key: "preview-empty", style: { width: 360,
+          height: 320, display: "flex", alignItems: "center",
+          justifyContent: "center", color: "#666", fontSize: 12,
+          background: "#0a0a0a", border: "1px solid #2c2c2c", borderRadius: 4,
+          fontFamily: "ui-sans-serif, system-ui" } },
+          getTrajOp.isExecuting ? "Loading paths…" : "No paths to show");
+      }
+      preview = h("div", { key: "preview", style: { display: "flex",
+        flexDirection: "column", gap: 6, flex: "0 0 auto" } },
+        [pvHeader, pvSvg]);
+    }
+
+    // ----- cluster swatches (ctrl/⌘-click to select multiple) -----
+    var swatches = null;
+    if (derived) {
+      var ids = Object.keys(derived.clusters).map(Number).sort(function (a, b) { return a - b; });
+      var chips = ids.map(function (cid) {
+        var mem = derived.clusters[cid];
+        var on = selectedClusterIds.has(cid);
+        return h("button", { key: "sw" + cid,
+          onClick: function (e) { onClusterClick(cid, e); },
+          title: "Click to select this cluster's " + mem.length
+            + " trajectories · ctrl/⌘-click to add to the selection",
+          style: { display: "flex", alignItems: "center", gap: 6,
+            background: on ? "#1c1c1c" : "transparent",
+            border: "1px solid " + (on ? V51_ORANGE : "#3a3a3a"),
+            borderRadius: 4, padding: "4px 8px", cursor: "pointer",
+            color: "#ddd", fontSize: 11, fontFamily: "ui-sans-serif, system-ui" } },
+        [
+          h("span", { key: "dot", style: { width: 10, height: 10,
+            borderRadius: 5, background: clusterColor(cid),
+            display: "inline-block" } }),
+          "Cluster " + cid + " · " + mem.length,
+        ]);
+      });
+      swatches = h("div", { key: "swatches", style: { display: "flex",
+        gap: 6, flexWrap: "wrap", alignItems: "center" } },
+        [
+          h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
+            fontFamily: "ui-sans-serif, system-ui", marginRight: 2 } },
+            "Drag the line to cut · click a cluster (ctrl/⌘-click for multiple):"),
+        ].concat(chips));
+    }
+
+    // ----- selection actions: tag / export the selected cluster(s) in place -----
+    var selActionBtn = function (key, label, enabled, title, onClick) {
+      return h("button", { key: key, style: enabled ? BTN_STYLE : BTN_DISABLED,
+        disabled: !enabled, title: title, onClick: onClick }, label);
+    };
+    var nClu = selectedClusterIds.size;
+    var nSel = selMembers.length;
+    var canTag = tagItems.length > 0;
+    var canExport = exportItems.length > 0;
+    var selectionActions = anySel
+      ? h("div", { key: "cl-selactions", style: { display: "flex", gap: 8,
+          alignItems: "center", flexWrap: "wrap", padding: "8px 10px",
+          background: "#171717", border: "1px solid #2c2c2c",
+          borderRadius: 4 } }, [
+          h("span", { key: "lbl", style: { fontSize: 12, color: "#ddd",
+            fontFamily: "ui-sans-serif, system-ui" } },
+            nClu + " cluster" + (nClu === 1 ? "" : "s") + " · " + nSel
+            + " trajector" + (nSel === 1 ? "y" : "ies") + " selected"),
+          h("input", { key: "tag-input", value: tagText,
+            placeholder: "tag (comma-sep)",
+            onChange: function (e) { setTagText(e.target.value); },
+            onKeyDown: function (e) {
+              if (e.key === "Enter") applyClusterTags("add");
+            },
+            style: { background: "#222", color: "#eee", border: "1px solid #444",
+              borderRadius: 4, padding: "4px 8px", fontSize: 12,
+              fontFamily: "ui-sans-serif, system-ui", width: 150 } }),
+          selActionBtn("tag-add", "Add tag",
+            canTag && tagText.trim().length > 0,
+            "Add tag(s) to the selected trajectories (written through to the "
+            + "detection labels; ego has no labels to tag)",
+            function () { applyClusterTags("add"); }),
+          selActionBtn("tag-rm", "Remove tag",
+            canTag && tagText.trim().length > 0,
+            "Remove tag(s) from the selected trajectories",
+            function () { applyClusterTags("remove"); }),
+          selActionBtn("export", "Export (.json)", canExport,
+            "Download the selected trajectories as JSON", exportSelected),
+          selActionBtn("clear", "Clear", true,
+            "Clear the cluster selection", clearClusterSelection),
+          (tagTrajOp.isExecuting || exportTrajOp.isExecuting)
+            ? h("span", { key: "busy", style: { fontSize: 11, color: "#888",
+                fontFamily: "ui-sans-serif, system-ui" } }, "working…")
+            : null,
+        ])
+      : null;
+
+    var body = h("div", { key: "cl-body", style: { display: "flex",
+      gap: 12, padding: 12, flexWrap: "wrap", alignItems: "flex-start" } }, [
+      h("div", { key: "left", style: { flex: "1 1 480px", minWidth: 360,
+        display: "flex", flexDirection: "column", gap: 10 } },
+        [dendro, swatches, selectionActions]),
+      preview,
+    ]);
+
+    return h("div", { style: { display: "flex", flexDirection: "column" } },
+             [toolbar, runsBar, banner, body]);
+  }
+
+
+  // ---------------------------------------------------------------------------
   // ---------------------------------------------------------------------------
   // ModalTimelineSync — bridge to FiftyOne's native modal timeline.
   // Rendered (and its playback hooks therefore only called) on the modal
@@ -1579,7 +2254,7 @@
       });
     };
 
-    var [activeTab, setActiveTab] = useState("scene");   // "scene" | "trajectories"
+    var [activeTab, setActiveTab] = useState("scene");   // "scene" | "trajectories" | "clusters"
     var [viewMode, setViewMode] = useState("base");      // "base" | "world"
     var [scrubFrameIdx, setScrubFrameIdx] = useState(null);
     // Seek fn into FiftyOne's native modal timeline, populated by the modal-only
@@ -2097,7 +2772,8 @@
       key: "tabbar",
       style: { display: "flex", gap: 4, padding: "0 8px",
                borderBottom: "1px solid #2c2c2c", background: "#141414" },
-    }, [tabBtn("scene", "Scene"), tabBtn("trajectories", "Trajectories")]);
+    }, [tabBtn("scene", "Scene"), tabBtn("trajectories", "Trajectories"),
+        tabBtn("clusters", "Clusters")]);
 
     var sceneTab = h("div", { key: "scene-tab" },
                      [header, bevBlock, timelineSync, scrubberBlock,
@@ -2111,7 +2787,9 @@
       tabBar,
       activeTab === "scene"
         ? sceneTab
-        : h(TrajectoriesTab, { key: "traj-tab", selectedScene: selectedScene }),
+        : (activeTab === "clusters"
+            ? h(ClustersTab, { key: "clusters-tab", selectedScene: selectedScene })
+            : h(TrajectoriesTab, { key: "traj-tab", selectedScene: selectedScene })),
     ]);
   }
 

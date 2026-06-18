@@ -1,5 +1,5 @@
 name: "@roboav8r/fiftyone-object-tracking"
-version: 0.3.0
+version: 0.4.4
 description: >
   FiftyOne plugin for working with grouped 3D tracking datasets:
   a generic Object Tracking panel with a per-scene bird's-eye-view
@@ -23,3 +23,8 @@ operators:
   - delete_trajectory_filter
   - tag_trajectories
   - export_trajectories
+  - cluster_trajectories
+  - get_clusters
+  - select_trajectories
+  - list_cluster_runs
+  - delete_cluster_run
