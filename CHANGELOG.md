@@ -37,6 +37,11 @@ once it leaves `0.x`.
 
 ### Added
 
+- **Selected singleton clusters are now highlighted on the dendrogram.** A
+  one-trajectory cluster has no below-threshold link of its own (just a leaf
+  stub on an above-threshold link), so selecting it showed nothing. Selecting
+  any cluster now draws a colored stub + base dot at each of its leaf positions
+  (up to the cut line), so singletons and multi-leaf clusters both highlight.
 - **Normalized cluster preview.** The Clusters-tab side preview has a
   **Normalized | Raw** toggle. *Normalized* (default) applies the same
   `origin_normalize` the clustering uses — every path starts at a common origin
