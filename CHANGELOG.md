@@ -6,6 +6,154 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once it leaves `0.x`.
 
+## [Unreleased]
+
+### Changed
+
+- **The Trajectories grid shows all built scenes by default.** Previously it
+  was scoped to the Scene tab's single selected scene, so "Build all scenes"
+  built every scene but the grid only ever showed one. The tab now has its own
+  **Scene** dropdown (`All scenes` + each built scene); `Select all` / filter /
+  tag / export act on the full set. The flat all-scenes grid is render-capped
+  (600 cells) with an explicit "Showing N of M" banner — no silent truncation —
+  and each cell shows its scene.
+- **Tags write through to every slice's detections, not just lidar.** Tagging a
+  trajectory now stamps the label tag on the matching `instance._id` across all
+  group slices that carry a `detections` field (lidar cuboids **and** the camera
+  2D boxes), so the tag shows wherever the track is viewed.
+- **Grid and saved-filters bar refresh automatically.** Mutating operators
+  (build, filter, apply/clear/delete saved filter, tag) now use the operator
+  completion `callback` (FiftyOne ≥2.18) instead of a fixed poll that started on
+  click — so a newly saved filter and the regrid appear without a manual refresh.
+
+### Fixed
+
+- **Clicking a cluster now lands the selection in the Trajectories grid.**
+  `select_trajectories` had no `resolve_input`, so on FiftyOne ≥ 2.18 the
+  executor dropped its `selection` param and the operator silently *cleared*
+  the selection instead of setting it. It now declares its input schema and
+  takes a list of `{scene_name, track_idx}` (matching `tag_trajectories` /
+  `export_trajectories`).
+
+### Fixed
+
+- **Dendrogram no longer looks flat for heavy-tailed clusterings.** Merge
+  heights are heavy-tailed (a few large outliers — e.g. a U-turn drives far
+  behind the origin), so the linear y-axis crammed ~⅔ of the merges into the
+  bottom few percent and the tree read as a flat comb that "doesn't cluster"
+  (most visible with heading-up ego clustering). The dendrogram now uses a
+  **log y-axis**, spreading the dense low-distance region so the structure is
+  visible and the cut line is draggable through it (drag down to split the big
+  cluster into sub-maneuvers). Clustering itself was unchanged — this was a
+  display scaling issue.
+- **Ego in the Ego/base frame no longer fakes a flat tree.** The ego is a single
+  point in its own base frame (`translations_base` is all zeros), so every ego
+  was an identical zero path → a distance-0 "tree." Spatially degenerate
+  (≈zero-extent) paths are now dropped before clustering, so an ego/base run
+  reports "Need at least 2 trajectories… (ego is a single point in the Ego/base
+  frame — use World or Scene-local)" instead. The frame picker says the same.
+
+### Added
+
+- **Heading-up normalization mode.** "Cluster trajectories…" now offers a
+  **Normalize** choice — **Chord** (default; start→end aligned, the prior
+  behavior), **Heading-up** (rotate so the trajectory's *initial* heading
+  points up), or **None** (translate to origin only). Heading-up anchors on
+  the starting orientation, so a path that turns around relative to its initial
+  heading drives **behind the origin** instead of collapsing to a forward line
+  — the natural way to separate straight / left / right / U-turn (and it
+  matches the customer's original demo convention). Pairs with World /
+  Scene-local frames; needs `heading0_rad` (serialized per tracklet from the
+  frame-0 pose), falling back to chord when absent (older builds → rebuild).
+  The mode applies to both clustering and the side preview, which is labeled
+  "Normalized (<mode>)" so it always matches the dendrogram.
+- **Selected singleton clusters are now highlighted on the dendrogram.** A
+  one-trajectory cluster has no below-threshold link of its own (just a leaf
+  stub on an above-threshold link), so selecting it showed nothing. Selecting a
+  singleton now draws a colored stub + base dot at its leaf position (up to the
+  cut line). Multi-member clusters are left as-is (their colored links already
+  read clearly), so the dendrogram stays uncluttered.
+- **Normalized cluster preview.** The Clusters-tab side preview has a
+  **Normalized | Raw** toggle. *Normalized* (default) applies the same
+  `origin_normalize` the clustering uses — every path starts at a common origin
+  (marked), aligned by its start→end chord — so straight / left / right turns
+  separate visually and match the cluster assignment. *Raw* shows the actual
+  frame geography. (Ego in the base frame is a single point; use World or
+  Scene-local for ego.)
+- **Pool trajectories across scenes ("All scenes").** Clustering "All scenes"
+  now builds ONE dendrogram over the chosen classes from every scene (stored
+  under `__all__`), so e.g. every run's ego path clusters together, or all cars
+  across runs. Single-scene clustering is unchanged. Cluster members are now
+  tracked as `(scene, track_idx)` pairs end-to-end.
+- **Ego is a clusterable class.** Ego appears in the class picker; with cross-
+  scene pooling you can cluster the per-run ego paths against each other.
+- **Select multiple clusters.** **ctrl/⌘-click** a cluster swatch to add it to
+  the selection (plain click still replaces); tag / export act on the union.
+- **Save & recall clustering runs.** "Cluster trajectories…" has a **Save run
+  as** field; the Clusters tab has a **Saved run** dropdown with **Apply**
+  (re-runs that configuration — scene, classes, frame, cut, …) and delete.
+  Saved per user; survives rebuilds (it stores the configuration, not the
+  cached result).
+- **Tag & export a cluster in place.** The Clusters tab now has an inline
+  selection toolbar (shown once a cluster is clicked): **Add tag** / **Remove
+  tag** (written through to the underlying detection labels), **Export
+  (.json)**, and **Clear** — no more hopping to the Trajectories tab.
+- **Cluster a subset of classes.** `cluster_trajectories` takes an optional
+  multi-select of object classes (default: all), so you can cluster, say, only
+  vehicles or only pedestrians — fewer, clearer clusters and faster compute.
+  (Ego is excluded — one track per scene.) The class set is part of the per-scene
+  params fingerprint, so changing it re-clusters rather than serving stale cache.
+- **Delegated execution for `cluster_trajectories`.** Large/all-scenes runs can
+  be scheduled as a delegated operation instead of blocking the App (immediate
+  execution stays available for small scenes). Requires a delegated-operation
+  orchestrator on the deployment; the Clusters tab notes that results arrive
+  asynchronously — use ↻ to refresh.
+- **Cluster trajectories by shape (DTW + hierarchical clustering).** A new
+  **Clusters** tab groups a scene's object trajectories by *shape* using
+  Dynamic Time Warping (speed/sampling invariant) + agglomerative clustering,
+  and renders the merge tree as an interactive dendrogram. **Drag the cut line**
+  to re-cluster live (the cut is recomputed client-side from the linkage matrix
+  — no server round-trip); **click a cluster** to select its trajectories. A
+  side BEV preview colors the paths by cluster. Selection reuses the existing
+  `filter_selection` plumbing, so the Trajectories grid highlights the same
+  set. Clustering is per-scene; rebuilding trajectories invalidates it.
+- **`cluster_trajectories`** (listed) — compute the DTW distance matrix +
+  hierarchical clustering for one scene or all built scenes and store the
+  linkage, cut, and dendrogram geometry under `clusters:{scene}`. Shape
+  normalization (`origin_normalize`) is on by default so clustering groups by
+  shape regardless of position/heading. DTW is `O(N²·T²)`, so paths are
+  arc-length-downsampled to `resample_points` (default 30) before DTW and each
+  scene is capped at `max_tracks` (default 400, longest tracks kept) with a
+  "Clustered N of M" banner — no silent truncation. An optional Sakoe-Chiba
+  `band` bounds the warp. (DTW runs serially: spawning subprocesses inside an
+  operator worker is unreliable, and resampling + the cap keep it fast.)
+- **`get_clusters`** (unlisted) — cheap read path for the Clusters tab, so
+  switching scenes never re-runs the `O(N²)` compute.
+- **`select_trajectories`** (unlisted) — write a raw `{scene: [track_idx]}`
+  selection into `filter_selection`; the seam that converges any selection
+  source (a clicked cluster, future similarity search) onto the existing
+  highlight path.
+- **Tag & export selected trajectories.** The Trajectories grid is now
+  multi-selectable: **ctrl/⌘-click** toggles one trajectory, **shift-click**
+  range-selects from the last-clicked anchor, and a **Select all** button
+  selects every shown object trajectory. A plain click still opens that
+  track's patches. A selection toolbar shows the count and exposes the new
+  actions.
+- **`tag_trajectories`** (unlisted) — add/remove free-form tags on the
+  selected trajectories. Tags are **written through to the underlying
+  detection label tags** (every `Detection` sharing the trajectory's
+  `instance._id` on the lidar slice), so they are durable, filterable in the
+  App sidebar, and re-hydrated onto the tracklets on the next
+  `build_trajectories`. The in-store tracklets are updated in place so the
+  grid reflects tags immediately (shown as chips on each cell).
+- **`export_trajectories`** (unlisted) — download the selected trajectories
+  as a JSON file (browser download via a base64 `data:` URL, so it works on
+  remote deployments). The document is `{scene_name: [record, …]}` where each
+  record carries identifiers (`scene_name`, `tracking_id`, `instance_id`,
+  `tracking_name`, `track_idx`), the scalar metadata, the `tags`, and the
+  per-frame `xy_base`/`xy_world` paths. Intended for an offline pass that
+  flags specific `tracking_id`/`instance_id`s for re-annotation.
+
 ## [0.3.0] — 2026-06-11
 
 ### Changed

@@ -128,13 +128,13 @@ loader scripts in `fiftyone-tracking-loaders` do this correctly.
 ```
 fiftyone-object-tracking/
 ├── fiftyone.yml          # plugin manifest (@roboav8r/fiftyone-object-tracking)
-├── __init__.py           # 3 operator classes + register()
+├── __init__.py           # operator classes + register()
 ├── _records.py           # TrajectoryRecord + build_track_records
 ├── _math.py              # SE(3) / quat helpers, gap stats, step velocities, …
-├── _schema.py            # SAMPLE_SCHEMA + SIDEBAR_GROUPS + helpers
+├── _dtw.py               # Dynamic Time Warping distance + pairwise matrix
+├── _clustering.py        # hierarchical clustering + dendrogram geometry
 ├── _palette.py           # class → hex color
-├── _thumbnail.py         # matplotlib BEV-thumbnail renderer
-├── dist/index.umd.js     # BEV panel (hand-written UMD)
+├── dist/index.umd.js     # Scene / Trajectories / Clusters panel (hand-written UMD)
 ├── environment.yml       # dev conda env
 ├── requirements.txt      # runtime python deps (numpy / scipy / matplotlib)
 ├── install.sh            # local-dev symlink helper
@@ -144,12 +144,16 @@ fiftyone-object-tracking/
 
 ## Roadmap
 
+Implemented:
+
+- `cluster_trajectories` — DTW + hierarchical clustering of trajectory
+  shapes, surfaced as the **Clusters** tab's interactive dendrogram
+  (drag-to-cut threshold, click-a-cluster to select).
+
 Slots reserved for future tracking-specific operators in this plugin:
 
 - `find_similar_trajectories` — DTW-based nearest-neighbor search
-  against a reference trajectory.
-- `cluster_trajectories` — hierarchical clustering + dendrogram
-  threshold panel.
+  against a reference trajectory (reuses `_dtw.py`).
 - `flag_qc_outliers` — auto-tag trajectories above configurable
   thresholds on the QC fields.
 - `evaluate_predicted_tracks` — GT-vs-predicted track evaluation

@@ -118,6 +118,46 @@ def origin_normalize(xy: np.ndarray) -> np.ndarray:
     return p @ rot.T
 
 
+def heading_normalize(xy: np.ndarray, heading0: float) -> np.ndarray:
+    """Translate to (0,0), rotate so initial heading ``heading0`` aligns +x.
+
+    Unlike ``origin_normalize`` (which anchors the start→end chord), this
+    anchors the trajectory's *starting orientation*, so a path that turns
+    around relative to its initial heading lands behind the origin (-x)
+    instead of collapsing to a forward line. ``heading0`` is a world-frame
+    yaw in radians, so this pairs with world / scene_local point arrays.
+    """
+    if xy.shape[0] < 1:
+        return xy
+    p = xy - xy[0:1]
+    c, s = math.cos(heading0), math.sin(heading0)
+    # Rotate every point by -heading0: x' = x c + y s, y' = -x s + y c.
+    rot = np.array([[c, s], [-s, c]], dtype=np.float64)
+    return p @ rot.T
+
+
+def resample_arclength(xy: np.ndarray, n: int) -> np.ndarray:
+    """Resample a path to ``n`` points evenly spaced along its arc length.
+
+    Only *downsamples* (returns the path unchanged when it already has
+    ``<= n`` points), so it caps the per-path length that feeds the
+    ``O(T^2)`` DTW without inflating short paths. Endpoints are preserved.
+    Degenerate (stationary / <2-point) paths are returned unchanged.
+    """
+    xy = np.asarray(xy, dtype=np.float64)
+    if n <= 1 or xy.shape[0] <= n or xy.shape[0] < 2:
+        return xy
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    d = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(d[-1])
+    if total <= 0.0:
+        return xy  # stationary; nothing meaningful to resample
+    t = np.linspace(0.0, total, n)
+    x = np.interp(t, d, xy[:, 0])
+    y = np.interp(t, d, xy[:, 1])
+    return np.stack([x, y], axis=1)
+
+
 def heading_change_deg(xy: np.ndarray) -> float:
     """Smoothed turning angle in degrees, +CCW; wrapped to (-180, 180]."""
     n = xy.shape[0]
