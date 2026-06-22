@@ -1655,6 +1655,10 @@ class ClusterTrajectories(foo.Operator):
         inputs.enum(
             "frame", frame_c.values(), default="world", view=frame_c,
             label="Reference frame",
+            description="World / Scene-local are world-aligned paths. Ego/base "
+                        "is each object's position relative to the ego — the "
+                        "EGO itself is a single point there, so cluster ego in "
+                        "World or Scene-local.",
         )
         norm_c = types.Choices()
         norm_c.add_choice("chord", label="Chord (start→end aligned)")
@@ -1776,8 +1780,13 @@ class ClusterTrajectories(foo.Operator):
                 "skipped": skipped, "params": params, "updated": time.time(),
             }
             if n_clustered < 2:
-                base["error"] = ("Need at least 2 trajectories to cluster "
-                                 "(try more classes, or All scenes).")
+                hint = ("try more classes, or All scenes")
+                if params["frame"] == "base":
+                    # Ego (and stationary tracks) are a single point in base
+                    # frame and get dropped — the usual cause of <2 here.
+                    hint = ("ego is a single point in the Ego/base frame — "
+                            "use World or Scene-local; or try more classes")
+                base["error"] = f"Need at least 2 trajectories to cluster ({hint})."
                 store.set(f"clusters:{result_key}", base)
                 return None
 

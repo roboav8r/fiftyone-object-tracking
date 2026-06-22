@@ -82,6 +82,15 @@ def tracks_to_arrays(
         if xy.ndim != 2 or xy.shape[0] < 2 or not np.all(np.isfinite(xy)):
             skipped.append(key)
             continue
+        # Drop spatially degenerate paths (≈zero extent): the ego is a single
+        # point in its own base frame (translations_base is all zeros), and a
+        # truly stationary object carries no shape. Clustering them yields an
+        # all-identical, distance-zero "tree" — better to skip so the caller's
+        # n<2 guard reports "need ≥2 trajectories" and the user picks World /
+        # Scene-local for ego.
+        if float(np.hypot(*(xy[:, :2].max(0) - xy[:, :2].min(0)))) < 1e-6:
+            skipped.append(key)
+            continue
         if resample:
             xy = resample_arclength(xy, resample)
         if mode == "none":

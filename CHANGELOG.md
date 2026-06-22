@@ -35,6 +35,24 @@ once it leaves `0.x`.
   takes a list of `{scene_name, track_idx}` (matching `tag_trajectories` /
   `export_trajectories`).
 
+### Fixed
+
+- **Dendrogram no longer looks flat for heavy-tailed clusterings.** Merge
+  heights are heavy-tailed (a few large outliers — e.g. a U-turn drives far
+  behind the origin), so the linear y-axis crammed ~⅔ of the merges into the
+  bottom few percent and the tree read as a flat comb that "doesn't cluster"
+  (most visible with heading-up ego clustering). The dendrogram now uses a
+  **log y-axis**, spreading the dense low-distance region so the structure is
+  visible and the cut line is draggable through it (drag down to split the big
+  cluster into sub-maneuvers). Clustering itself was unchanged — this was a
+  display scaling issue.
+- **Ego in the Ego/base frame no longer fakes a flat tree.** The ego is a single
+  point in its own base frame (`translations_base` is all zeros), so every ego
+  was an identical zero path → a distance-0 "tree." Spatially degenerate
+  (≈zero-extent) paths are now dropped before clustering, so an ego/base run
+  reports "Need at least 2 trajectories… (ego is a single point in the Ego/base
+  frame — use World or Scene-local)" instead. The frame picker says the same.
+
 ### Added
 
 - **Heading-up normalization mode.** "Cluster trajectories…" now offers a

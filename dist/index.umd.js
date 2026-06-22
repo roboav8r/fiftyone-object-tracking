@@ -1694,7 +1694,10 @@
         if (!g.plotH) return;
         var rect = svgRef.current.getBoundingClientRect();
         var yView = (e.clientY - rect.top) * (g.H / rect.height);
-        var d = g.dMaxH * (1 - (yView - g.top) / g.plotH);
+        // Inverse of the log1p height→pixel map (see py() below): merge heights
+        // are heavy-tailed, so a log axis keeps the dense low region draggable.
+        var yfrac = 1 - (yView - g.top) / g.plotH;
+        var d = Math.expm1(yfrac * Math.log1p(g.dMaxH));
         setThreshold(Math.max(0, Math.min(g.dMaxH, d)));
       }
       function onUp() { draggingRef.current = false; }
@@ -1952,7 +1955,12 @@
       var dMaxH = dMax > 0 ? dMax * 1.05 : 1;
       geomRef.current = { H: H, top: mT, plotH: plotH, dMaxH: dMaxH };
       var px = function (icoVal) { return mL + (icoVal / xMax) * plotW; };
-      var py = function (d) { return mT + (1 - d / dMaxH) * plotH; };
+      // Log y-axis: DTW merge heights are heavy-tailed (a few large outliers,
+      // e.g. a U-turn), so a linear scale crams most merges into the bottom few
+      // percent and the tree looks flat. log1p spreads the dense low region so
+      // structure is visible and the cut is draggable through it.
+      var logDen = Math.log1p(dMaxH);
+      var py = function (d) { return mT + (1 - Math.log1p(d) / logDen) * plotH; };
 
       var links = ico.map(function (seg, k) {
         var d4 = dco[k];
@@ -2002,7 +2010,7 @@
       var axis = h("text", { key: "ax", x: 13, y: mT + plotH / 2, fill: "#888",
         fontSize: 10, fontFamily: "ui-sans-serif, system-ui",
         transform: "rotate(-90 13," + (mT + plotH / 2) + ")",
-        textAnchor: "middle" }, "DTW distance");
+        textAnchor: "middle" }, "DTW distance (log)");
       var startDrag = function (e) { draggingRef.current = true; e.preventDefault(); };
       var lineGrab = h("line", { key: "thg", x1: mL, y1: ty, x2: W - mR, y2: ty,
         stroke: "transparent", strokeWidth: 12, style: { cursor: "ns-resize" },
