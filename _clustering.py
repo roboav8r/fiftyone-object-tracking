@@ -18,7 +18,7 @@ import numpy as np
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from ._math import origin_normalize, resample_arclength
+from ._math import heading_normalize, origin_normalize, resample_arclength
 
 # Which per-frame point array a tracklet exposes for each reference frame.
 _FRAME_KEYS = {
@@ -27,12 +27,23 @@ _FRAME_KEYS = {
     "scene_local": "xy_scene_local",
 }
 
+# Accepted normalization modes (bool kept for back-compat: True→chord).
+_NORM_MODES = ("chord", "heading", "none")
+
+
+def _norm_mode(normalize) -> str:
+    if normalize is True:
+        return "chord"
+    if normalize is False:
+        return "none"
+    return normalize if normalize in _NORM_MODES else "chord"
+
 
 def tracks_to_arrays(
     scene_tracklets,
     *,
     frame_key: str = "world",
-    normalize: bool = True,
+    normalize="chord",
     resample: int = 0,
 ) -> tuple[list[dict], list[np.ndarray], list[dict]]:
     """Build clusterable ``(T, 2)`` arrays from ``(scene_name, tracklet)`` pairs.
@@ -46,13 +57,22 @@ def tracks_to_arrays(
     ego path), and the row→member map resolves back to the right tracklet
     for select / tag / export.
 
-    Class / ego membership is the CALLER's decision (filter before calling);
-    this builder no longer special-cases ego. ``resample > 0`` arc-length-
-    downsamples each path to at most that many points (DTW is
-    ``O(T_a * T_b)`` per pair; sampling-invariance means clusters barely
-    change).
+    ``normalize`` mode (str; bool accepted for back-compat):
+      - ``"chord"`` — translate to origin, rotate so start→end aligns +x
+        (groups by overall bend; collapses turn-arounds to a line).
+      - ``"heading"`` — translate to origin, rotate so the trajectory's
+        INITIAL heading (``heading0_rad``) aligns +x; a turn-around then
+        drives behind the origin. Falls back to chord when ``heading0_rad``
+        is absent. Meaningful for world / scene_local frames (world-aligned).
+      - ``"none"`` — translate to origin only (keeps absolute heading).
+
+    Class / ego membership is the CALLER's decision (filter before calling).
+    ``resample > 0`` arc-length-downsamples each path to at most that many
+    points (DTW is ``O(T_a * T_b)`` per pair; sampling-invariance means
+    clusters barely change).
     """
     xy_field = _FRAME_KEYS.get(frame_key, "xy_world")
+    mode = _norm_mode(normalize)
     members: list[dict] = []
     arrays: list[np.ndarray] = []
     skipped: list[dict] = []
@@ -64,7 +84,13 @@ def tracks_to_arrays(
             continue
         if resample:
             xy = resample_arclength(xy, resample)
-        if normalize:
+        if mode == "none":
+            xy = xy - xy[0:1]
+        elif mode == "heading":
+            h0 = t.get("heading0_rad")
+            xy = (heading_normalize(xy, float(h0)) if h0 is not None
+                  else origin_normalize(xy))
+        else:  # chord
             xy = origin_normalize(xy)
         members.append(key)
         arrays.append(xy)

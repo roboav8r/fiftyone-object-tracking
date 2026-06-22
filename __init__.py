@@ -453,6 +453,19 @@ def _record_to_tracklet(record: TrajectoryRecord, track_idx: int) -> dict:
     out["xy_base"] = _xy_list(record.translations_base)
     out["xy_world"] = _xy_list(record.translations_world)
     out["xy_scene_local"] = _xy_list(record.translations_scene_local)
+    # Initial world heading (yaw at frame 0), so "heading-up" cluster
+    # normalization can anchor on the trajectory's starting orientation —
+    # the only way a turn-around shows up driving *behind* the origin
+    # instead of collapsing to a straight line. None when unavailable
+    # (older builds / missing pose); the normalizer then falls back to chord.
+    out["heading0_rad"] = None
+    rw = record.rotations_world
+    if rw is not None:
+        rw = np.asarray(rw, dtype=np.float64)
+        if rw.ndim == 2 and rw.shape[0] >= 1 and np.all(np.isfinite(rw[0])):
+            q = rw[0]
+            out["heading0_rad"] = _quat_to_yaw(
+                float(q[0]), float(q[1]), float(q[2]), float(q[3]))
     return out
 
 
@@ -1562,9 +1575,16 @@ def _cluster_params(ctx) -> dict:
         band = None
     raw_classes = ctx.params.get("classes")
     classes = sorted({str(c) for c in raw_classes}) if raw_classes else None
+    # Normalization mode: "chord" (default) | "heading" | "none". Accept a
+    # legacy bool (saved runs / old forms): True→chord, False→none.
+    nz = ctx.params.get("normalize", "chord")
+    if isinstance(nz, bool):
+        nz = "chord" if nz else "none"
+    if nz not in ("chord", "heading", "none"):
+        nz = "chord"
     return {
         "frame": ctx.params.get("frame") or "world",
-        "normalize": bool(ctx.params.get("normalize", True)),
+        "normalize": nz,
         "method": ctx.params.get("method") or "average",
         "num_clusters": int(ctx.params.get("num_clusters") or 4),
         "distance_threshold": dt,
@@ -1636,11 +1656,18 @@ class ClusterTrajectories(foo.Operator):
             "frame", frame_c.values(), default="world", view=frame_c,
             label="Reference frame",
         )
-        inputs.bool(
-            "normalize", default=True, label="Normalize shape",
-            description="Translate each path to the origin and rotate so its "
-                        "start→end chord points the same way, so clustering "
-                        "groups by shape regardless of position/heading.",
+        norm_c = types.Choices()
+        norm_c.add_choice("chord", label="Chord (start→end aligned)")
+        norm_c.add_choice("heading", label="Heading-up (initial facing up)")
+        norm_c.add_choice("none", label="None (keep heading)")
+        inputs.enum(
+            "normalize", norm_c.values(), default="chord", view=norm_c,
+            label="Normalize shape",
+            description="Chord: rotate so start→end aligns — groups by overall "
+                        "bend (turn-arounds collapse to a line). Heading-up: "
+                        "rotate so the INITIAL heading points up, so a turn-"
+                        "around drives behind the origin (pairs with World / "
+                        "Scene-local). None: translate to origin only.",
         )
 
         classes = _built_classes(ctx.store(STORE_NAME), store.get("meta") or {})

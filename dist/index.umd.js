@@ -1538,6 +1538,42 @@
     return [rx, ry];
   }
 
+  // Mirror of _math.heading_normalize: translate to origin, rotate so the
+  // INITIAL heading (h0, radians) points +x — so a turn-around drives behind
+  // the origin instead of collapsing to a forward line.
+  function headingNormalize(xs, ys, h0) {
+    var n = xs.length, i;
+    if (n < 1) return [xs, ys];
+    var c = Math.cos(h0), s = Math.sin(h0), rx = [], ry = [];
+    for (i = 0; i < n; i++) {
+      var dx = xs[i] - xs[0], dy = ys[i] - ys[0];
+      rx.push(dx * c + dy * s);     // x' = x c + y s
+      ry.push(-dx * s + dy * c);    // y' = -x s + y c
+    }
+    return [rx, ry];
+  }
+
+  // Coerce a blob's normalize field (string mode, or legacy bool) to a mode.
+  function normMode(v) {
+    if (v === true) return "chord";
+    if (v === false) return "none";
+    return (v === "heading" || v === "none") ? v : "chord";
+  }
+
+  // Apply a normalization mode to a path for the preview, matching the
+  // clustering. heading falls back to chord when h0 is unavailable.
+  function normalizeForPreview(xs, ys, mode, h0) {
+    if (mode === "none") {
+      var tx = [], ty = [], i;
+      for (i = 0; i < xs.length; i++) { tx.push(xs[i] - xs[0]); ty.push(ys[i] - ys[0]); }
+      return [tx, ty];
+    }
+    if (mode === "heading" && h0 !== null && h0 !== undefined) {
+      return headingNormalize(xs, ys, h0);
+    }
+    return originNormalize(xs, ys);
+  }
+
   function ClustersTab(props) {
     var promptInput = foo.usePromptOperatorInput();
     var getClustersOp = foo.useOperatorExecutor(OP("get_clusters"));
@@ -1989,14 +2025,16 @@
     }
 
     // ----- BEV preview: clustered paths, colored by cluster -----
-    // "Normalized" applies the same origin_normalize the clustering uses, so
-    // straight / left / right separate from a common origin; "Raw" shows the
-    // actual frame geography. (Ego in base frame is a single point — use World
-    // or Scene-local for ego.)
+    // "Normalized" applies the SAME normalization this run clustered with
+    // (chord / heading / none), so the preview matches the dendrogram; "Raw"
+    // shows the actual frame geography. With heading-up, a turn-around drives
+    // behind the origin. (Ego in base frame is a single point — use World or
+    // Scene-local for ego.)
     var preview = null;
     if (blob && !blob.error && derived) {
       var frameKey = blob.frame === "base" ? "xy_base"
         : (blob.frame === "scene_local" ? "xy_scene_local" : "xy_world");
+      var pvMode = normMode(blob.normalize);
       var paths = [];
       var pxMin = Infinity, pxMax = -Infinity, pyMin = Infinity, pyMax = -Infinity;
       var pvMembers = derived.members;
@@ -2012,7 +2050,10 @@
           }
         }
         if (xs.length < 2) continue;
-        if (previewNorm) { var nn = originNormalize(xs, ys); xs = nn[0]; ys = nn[1]; }
+        if (previewNorm) {
+          var nn = normalizeForPreview(xs, ys, pvMode, tk.heading0_rad);
+          xs = nn[0]; ys = nn[1];
+        }
         for (var b = 0; b < xs.length; b++) {
           if (xs[b] < pxMin) pxMin = xs[b];
           if (xs[b] > pxMax) pxMax = xs[b];
@@ -2035,7 +2076,7 @@
         alignItems: "center" } }, [
         h("span", { key: "lbl", style: { fontSize: 11, color: "#888",
           fontFamily: "ui-sans-serif, system-ui", marginRight: 2 } }, "Preview:"),
-        pvToggleBtn(true, "Normalized"), pvToggleBtn(false, "Raw"),
+        pvToggleBtn(true, "Normalized (" + pvMode + ")"), pvToggleBtn(false, "Raw"),
       ]);
 
       var pvSvg;

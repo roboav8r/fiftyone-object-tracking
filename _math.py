@@ -118,6 +118,24 @@ def origin_normalize(xy: np.ndarray) -> np.ndarray:
     return p @ rot.T
 
 
+def heading_normalize(xy: np.ndarray, heading0: float) -> np.ndarray:
+    """Translate to (0,0), rotate so initial heading ``heading0`` aligns +x.
+
+    Unlike ``origin_normalize`` (which anchors the start→end chord), this
+    anchors the trajectory's *starting orientation*, so a path that turns
+    around relative to its initial heading lands behind the origin (-x)
+    instead of collapsing to a forward line. ``heading0`` is a world-frame
+    yaw in radians, so this pairs with world / scene_local point arrays.
+    """
+    if xy.shape[0] < 1:
+        return xy
+    p = xy - xy[0:1]
+    c, s = math.cos(heading0), math.sin(heading0)
+    # Rotate every point by -heading0: x' = x c + y s, y' = -x s + y c.
+    rot = np.array([[c, s], [-s, c]], dtype=np.float64)
+    return p @ rot.T
+
+
 def resample_arclength(xy: np.ndarray, n: int) -> np.ndarray:
     """Resample a path to ``n`` points evenly spaced along its arc length.
 

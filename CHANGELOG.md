@@ -37,6 +37,18 @@ once it leaves `0.x`.
 
 ### Added
 
+- **Heading-up normalization mode.** "Cluster trajectories…" now offers a
+  **Normalize** choice — **Chord** (default; start→end aligned, the prior
+  behavior), **Heading-up** (rotate so the trajectory's *initial* heading
+  points up), or **None** (translate to origin only). Heading-up anchors on
+  the starting orientation, so a path that turns around relative to its initial
+  heading drives **behind the origin** instead of collapsing to a forward line
+  — the natural way to separate straight / left / right / U-turn (and it
+  matches the customer's original demo convention). Pairs with World /
+  Scene-local frames; needs `heading0_rad` (serialized per tracklet from the
+  frame-0 pose), falling back to chord when absent (older builds → rebuild).
+  The mode applies to both clustering and the side preview, which is labeled
+  "Normalized (<mode>)" so it always matches the dendrogram.
 - **Selected singleton clusters are now highlighted on the dendrogram.** A
   one-trajectory cluster has no below-threshold link of its own (just a leaf
   stub on an above-threshold link), so selecting it showed nothing. Selecting a
