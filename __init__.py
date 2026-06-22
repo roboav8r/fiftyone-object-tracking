@@ -392,6 +392,13 @@ class GetSceneTrackPayload(foo.Operator):
 # get_trajectories; nothing is persisted as FiftyOne samples.
 STORE_NAME = "object_tracking"
 
+# Ego has no Detection to write a label tag onto, so its trajectory tags live
+# in this dataset-scoped store key — a {scene_name: [tags]} dict that survives
+# rebuilds (build_trajectories does NOT delete it) and is re-hydrated onto the
+# ego tracklet on each build, mirroring how object tags re-hydrate from labels.
+EGO_TAGS_KEY = "ego_tags"
+EGO_INSTANCE_ID = "ego"
+
 # Scalar fields copied verbatim from a TrajectoryRecord into a tracklet
 # dict. Per-frame arrays are handled separately (downsampled to XY).
 _TRACKLET_SCALARS = (
@@ -523,6 +530,9 @@ class BuildTrajectories(foo.Operator):
         )
 
         store = ctx.store(STORE_NAME)
+        # Durable ego tags survive rebuilds (not deleted below); re-hydrated
+        # onto the ego tracklet per scene since ego has no label to read from.
+        ego_tags_all = store.get(EGO_TAGS_KEY) or {}
         built: list[str] = []
         total = 0
         classes_seen: set[str] = set()
@@ -549,6 +559,13 @@ class BuildTrajectories(foo.Operator):
                 iid = t.get("instance_id")
                 if iid and str(iid) in tag_map:
                     t["tags"] = sorted(tag_map[str(iid)])
+            # Ego has no label to re-hydrate from — pull its tags from the
+            # durable ego-tags store instead.
+            ego_scene_tags = ego_tags_all.get(scene_name) or []
+            if ego_scene_tags:
+                for t in tracklets:
+                    if t.get("kind") == "ego":
+                        t["tags"] = sorted(ego_scene_tags)
             for t in tracklets:
                 if t.get("kind") == "ego":
                     classes_seen.add("ego")
@@ -1348,28 +1365,32 @@ class TagTrajectories(foo.Operator):
         if mode not in ("add", "remove"):
             return {"error": f"invalid mode {mode!r}"}
 
-        # Group the selection by scene, keeping only real (object) tracks.
-        by_scene: dict[str, list[str]] = {}
+        # Group the selection by scene, splitting object tracks (tagged via
+        # detection labels by instance hex) from ego (no Detection to tag —
+        # routed to the durable EGO_TAGS_KEY store, re-hydrated on rebuild).
+        obj_by_scene: dict[str, list[str]] = {}
+        ego_scenes: set[str] = set()
         for item in (ctx.params.get("selection") or []):
             scene = item.get("scene_name")
             iid = item.get("instance_id")
-            if not scene or not iid:
+            if not scene:
                 continue
-            by_scene.setdefault(scene, []).append(str(iid))
-
-        # Every group slice carrying a ``detections`` field — the lidar
-        # cuboids plus the camera 2D boxes — shares the same instance ids,
-        # so the tag lands on the track wherever it's viewed.
-        det_slices = _detection_slices(ds)
-        if not det_slices:
-            return {"error": "No group slice has a 'detections' field."}
+            if iid == EGO_INSTANCE_ID or item.get("kind") == "ego":
+                ego_scenes.add(scene)
+            elif iid:
+                obj_by_scene.setdefault(scene, []).append(str(iid))
 
         store = ctx.store(STORE_NAME)
         n_tracklets = 0
         n_labels = 0
         by_scene_counts: dict[str, int] = {}
 
-        for scene, hexes in by_scene.items():
+        # Only need detection slices if real object tracks were selected.
+        det_slices = _detection_slices(ds) if obj_by_scene else []
+        if obj_by_scene and not det_slices:
+            return {"error": "No group slice has a 'detections' field."}
+
+        for scene, hexes in obj_by_scene.items():
             try:
                 oids = [ObjectId(h) for h in hexes]
             except Exception as e:
@@ -1394,19 +1415,37 @@ class TagTrajectories(foo.Operator):
             for t in rows:
                 if str(t.get("instance_id")) in want:
                     cur = set(t.get("tags") or [])
-                    if mode == "add":
-                        cur.update(tags)
-                    else:
-                        cur.difference_update(tags)
+                    cur.update(tags) if mode == "add" else cur.difference_update(tags)
                     t["tags"] = sorted(cur)
                     n_tracklets += 1
             store.set(f"tracklets:{scene}", rows)
-            by_scene_counts[scene] = len(hexes)
+            by_scene_counts[scene] = by_scene_counts.get(scene, 0) + len(hexes)
+
+        # ----- ego: durable per-scene tag store (+ mirror onto the tracklet) -----
+        n_ego = 0
+        if ego_scenes:
+            ego_tags = dict(store.get(EGO_TAGS_KEY) or {})
+            for scene in ego_scenes:
+                cur = set(ego_tags.get(scene) or [])
+                cur.update(tags) if mode == "add" else cur.difference_update(tags)
+                if cur:
+                    ego_tags[scene] = sorted(cur)
+                else:
+                    ego_tags.pop(scene, None)
+                rows = store.get(f"tracklets:{scene}") or []
+                for t in rows:
+                    if t.get("kind") == "ego":
+                        t["tags"] = sorted(cur)
+                        n_ego += 1
+                store.set(f"tracklets:{scene}", rows)
+                by_scene_counts[scene] = by_scene_counts.get(scene, 0) + 1
+            store.set(EGO_TAGS_KEY, ego_tags)
 
         return {
             "mode": mode,
             "tags": tags,
             "n_tracklets": n_tracklets,
+            "n_ego": n_ego,
             "n_labels": n_labels,
             "by_scene": by_scene_counts,
         }
