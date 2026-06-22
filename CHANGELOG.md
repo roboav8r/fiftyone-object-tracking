@@ -8,6 +8,16 @@ once it leaves `0.x`.
 
 ## [Unreleased]
 
+### Added
+
+- **Ego trajectories are now taggable (durably).** Ego has no `Detection` to
+  write a label tag onto, so its Add/Remove tag buttons were disabled. Ego tags
+  now persist in a dedicated dataset-scoped store key (`ego_tags`, a
+  `{scene: [tags]}` map) that survives rebuilds and is re-hydrated onto the ego
+  tracklet on each `build_trajectories` — mirroring how object tags re-hydrate
+  from detection labels. Tagging a mixed selection routes objects to label tags
+  and ego to the ego-tag store transparently.
+
 ### Changed
 
 - **The Trajectories grid shows all built scenes by default.** Previously it

@@ -1761,18 +1761,19 @@
     // ----- act on the selected clusters in place (tag / export) -----
     var anySel = selectedClusterIds.size > 0;
     var selMembers = unionMembers(selectedClusterIds);
-    // Export works on any track (scene + track_idx). Tagging needs the FO
-    // instance id and is meaningless for ego (no detection labels), so it
-    // resolves through the loaded tracklets and drops ego/missing.
+    // Export works on any track (scene + track_idx). Tagging resolves through
+    // the loaded tracklets: object tags write through to detection labels by
+    // instance id; ego (kind "ego", no label) is routed to the durable ego-tag
+    // store by the operator — so ego IS taggable, just persisted differently.
     var exportItems = selMembers.map(function (m) {
       return { scene_name: m.scene_name, track_idx: m.track_idx };
     });
     var tagItems = selMembers
       .map(function (m) { return trackById[keyOf(m.scene_name, m.track_idx)]; })
-      .filter(function (t) { return t && t.kind !== "ego" && t.instance_id; })
+      .filter(function (t) { return t && (t.instance_id || t.kind === "ego"); })
       .map(function (t) {
         return { scene_name: t.scene_name, instance_id: t.instance_id,
-                 track_idx: t.track_idx };
+                 track_idx: t.track_idx, kind: t.kind };
       });
 
     function applyClusterTags(mode) {
@@ -1800,6 +1801,10 @@
       if (!run) return;
       var p = Object.assign({}, run.params || {},
         { scene: run.scene, max_tracks: run.max_tracks });
+      // normalize is now an enum (chord/heading/none); a run saved before that
+      // change stored a bool — coerce so the enum validation doesn't reject it.
+      if (p.normalize === true) p.normalize = "chord";
+      else if (p.normalize === false) p.normalize = "none";
       var targetView = run.scene === "__all__" ? "__all__" : run.scene;
       try {
         applyRunOp.execute(p, { callback: function () {
@@ -2196,8 +2201,8 @@
               fontFamily: "ui-sans-serif, system-ui", width: 150 } }),
           selActionBtn("tag-add", "Add tag",
             canTag && tagText.trim().length > 0,
-            "Add tag(s) to the selected trajectories (written through to the "
-            + "detection labels; ego has no labels to tag)",
+            "Add tag(s) to the selected trajectories — objects write through to "
+            + "the detection labels; ego tags persist in a durable ego-tag store",
             function () { applyClusterTags("add"); }),
           selActionBtn("tag-rm", "Remove tag",
             canTag && tagText.trim().length > 0,
