@@ -1,5 +1,9 @@
 # Scene
 
+- **`ObjectTracking` panel** — per-scene bird's-eye-view of
+  object trajectories with a timeline scrubber, base ↔ world toggle,
+  per-instance presence rows, and pan / zoom.
+
 The **Scene** tab of the `ObjectTracking` panel is a per-scene
 bird's-eye-view of object trajectories, rendered live from the source
 tracking dataset with a timeline scrubber, a base ↔ world frame toggle,

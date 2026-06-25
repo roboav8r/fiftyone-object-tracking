@@ -1,34 +1,54 @@
 # fiftyone-object-tracking
 
-FiftyOne plugin for working with grouped 3D tracking datasets:
+FiftyOne Object Tracking (FOOT) is a [FiftyOne Plugin](https://docs.voxel51.com/plugins/index.html) designed to simplify the development of multi-object tracking (MOT) systems. 
 
-- **Build per-trajectory datasets** from a tracking source via the
-  `build_trajectories` operator. Each trajectory sample is a single
-  PNG (BEV plot rendered server-side with matplotlib at build time:
-  forward up, left to the left, start `o`, end `x`, ego rectangle at
-  origin) plus ~50 filter-friendly scalar facets grouped under
-  `Identity` / `Coverage` / `Position (base)` / `Position (world)` /
-  `Motion` / `Shape` / `QC`. FO's built-in image renderer handles
-  the grid + modal — no custom JS sample renderer.
-- **`ObjectTracking` panel** — per-scene bird's-eye-view of
-  object trajectories with a timeline scrubber, base ↔ world toggle,
-  per-instance presence rows, and pan / zoom.
+As robots and intelligent systems operate in dynamic, real-world environments, it's important for them to perceive nearby objects and predict their future states in real-time. MOT provides the classes and states of nearby objects, making it a solid foundation for a physical AI perception stack. MOT is used in robotics, autonomous vehicles, security/defense, smart spaces, retail applications, and many other areas.
 
-Source datasets are produced by a separate, private dataloaders repo
-(one loader per source format, each emitting the canonical
-per-(scene, frame, sensor) grouped schema). This plugin's
-trajectory operator is dataset-agnostic — it consumes the canonical
-schema, regardless of which loader produced it.
+Despite their importance to physical AI, development and debugging MOT systems is notoriously complex: there are multiple models and parameters that change depending on the operating environment and object being tracked.
 
-## Requirements
+To this end, FOOT aims to make the MOT development process more intuitive, in true FiftyOne fashion. Foot can be used for:
+- Visualizing tracking scenes and sequences
+- Inspecting and quality checking track annotations
+- Retrieving similar tracks and trajectories of known objects
+- (Planned) Training, applying, and evaluating MOT models to datasets
 
-<!-- TODO -->
+**If you are a developer or user of multiple object tracking, please read on!**
 
 ## Highlights
 
-<!-- TODO -->
+### [Tracking scene visualization](docs/SCENE.md)
 
-## Install
+Visualize all objects and the ego-vehicle in a scene via a birds-eye-view (BEV) panel. Visualize scene progression in vehicle or world frame, and seek specific moments using the timeline scrubber.
+
+For visualizing data streams and replaying specific episodes in your tracking dataset to gain a high-level overview.
+
+### [Trajectory panel](docs/TRAJECTORIES.md)
+Extract, inspect, and quality check trajectories for each 
+object in the dataset. View the detections for a specific object. 
+Tag and export for further usage.
+
+Useful for identifying track annotation errors or quality checking.
+
+### [Clustering](docs/CLUSTERS.md)
+Group similar-shaped trajectories using dynamic time warping 
+- hierarchical clustering (DTW-HC). Then, tag and export them.
+
+Useful for finding similar categories of trajectories 
+(e.g. vehicle left turns, pedestrian crossingss) and the
+parent scenes.
+
+## Requirements
+
+- FiftyOne installed (open-source or FiftyOne Enterprise)
+- A FiftyOne dataset that adheres to the [docs/DATASET_SCHEMA.md](dataset schema)
+
+Source datasets are produced by a separate dataloader (not included).
+which emits a canonical per-(scene, frame, sensor) grouped schema. 
+This plugin is dataset-agnostic; it consumes the canonical
+schema, regardless of how it was produced or the domain.
+
+
+## Installation
 
 The plugin installs like any other FiftyOne plugin — see the canonical
 docs for [FiftyOne (OSS)](https://docs.voxel51.com/plugins/using_plugins.html)
@@ -47,17 +67,20 @@ the Enterprise UI (drag-and-drop a ZIP), or via the Management SDK:
 import fiftyone.management as fom
 fom.upload_plugin("/path/to/fiftyone-object-tracking", overwrite=True)
 ```
+## Quickstart Guide
+[TODO]
 
-## Documentation
+## Detailed Usage
+For detailed usage instructions, refer to the appropriate documentation pages for the task you'd like to perform:
 
 | Doc | What it covers |
 |---|---|
-| [docs/DATASET_SCHEMA.md](docs/DATASET_SCHEMA.md) | Canonical source-dataset schema + cuboid rotation convention |
+| [docs/DATASET_SCHEMA.md](docs/DATASET_SCHEMA.md) | Canonical source-dataset schema + conventions |
 | [docs/SCENE.md](docs/SCENE.md) | Per-scene BEV panel (timeline scrubber, base ↔ world) |
 | [docs/TRAJECTORIES.md](docs/TRAJECTORIES.md) | Build + browse per-trajectory datasets |
 | [docs/CLUSTERS.md](docs/CLUSTERS.md) | DTW + hierarchical clustering of trajectory shapes |
 
-## Layout
+## Repo Organization
 
 ```
 fiftyone-object-tracking/

@@ -17,6 +17,15 @@ trajectories dataset" → fill the form (target name, trajectory_root,
 overwrite) → run. The new trajectories dataset appears in the App's
 dataset selector.
 
+- **Build per-trajectory datasets** from a tracking source via the
+  `build_trajectories` operator. Each trajectory sample is a single
+  PNG (BEV plot rendered server-side with matplotlib at build time:
+  forward up, left to the left, start `o`, end `x`, ego rectangle at
+  origin) plus ~50 filter-friendly scalar facets grouped under
+  `Identity` / `Coverage` / `Position (base)` / `Position (world)` /
+  `Motion` / `Shape` / `QC`. FO's built-in image renderer handles
+  the grid + modal — no custom JS sample renderer.
+
 ## Build trajectories from the SDK / CLI
 
 ```bash
